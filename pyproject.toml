@@ -9,6 +9,7 @@ description = "Fail-closed research tooling for the CMP 170HX GA100 firmware stu
 readme = "README.md"
 requires-python = ">=3.10"
 license = "GPL-2.0-only"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 authors = [{ name = "CMP 170HX research tooling contributors" }]
 classifiers = [
   "Development Status :: 3 - Alpha",

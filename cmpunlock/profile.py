@@ -223,6 +223,10 @@ class FirmwareProfile:
             raise ProfileError("this implementation only supports the paper's 0xF800 payload")
         if self.dma_target != 0x800 or self.guard_address != 0x6340:
             raise ProfileError("DMEM layout does not match the published paper")
+        if self.proof_fill != 0x4A7:
+            raise ProfileError(
+                "exploit.proof_fill does not match the paper's 0x4a7 control value"
+            )
         for name, value in (
             ("exploit.proof_fill", self.proof_fill),
             ("exploit.canary_replacement", self.canary_replacement),
@@ -246,8 +250,10 @@ class FirmwareProfile:
             raise ProfileError("frame field offsets must be nonnegative")
         if self.frame_stride <= 0 or self.frame_stride % 4:
             raise ProfileError("frame stride must be a positive dword multiple")
-        if sorted(self.frame_fields) != list(self.frame_fields):
-            raise ProfileError("frame field offsets must be increasing")
+        if any(
+            left >= right for left, right in zip(self.frame_fields, self.frame_fields[1:])
+        ):
+            raise ProfileError("frame field offsets must be strictly increasing")
         if self.frame_fields[-1] + 4 > self.frame_stride:
             raise ProfileError("frame fields exceed the frame stride")
         payload_end = self.dma_target + self.payload_size

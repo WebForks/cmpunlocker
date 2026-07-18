@@ -54,6 +54,16 @@ def test_profile_rejects_frame_outside_payload(profile_580_105_raw: dict[str, ob
         FirmwareProfile.from_dict(raw)
 
 
+def test_profile_rejects_duplicate_frame_offsets(
+    profile_580_105_raw: dict[str, object],
+) -> None:
+    raw = copy.deepcopy(profile_580_105_raw)
+    raw["exploit"]["frame_field_offsets"] = [0, 4, 8, 8, 16, 20]  # type: ignore[index]
+
+    with pytest.raises(ProfileError, match="strictly increasing"):
+        FirmwareProfile.from_dict(raw)
+
+
 def test_profile_rejects_misaligned_bar0_write(profile_580_105_raw: dict[str, object]) -> None:
     raw = copy.deepcopy(profile_580_105_raw)
     raw["compute"]["host_writes"][0]["address"] = "0x82381d"  # type: ignore[index]
@@ -70,6 +80,16 @@ def test_profile_rejects_proof_fill_outside_dword(
     raw["exploit"]["proof_fill"] = proof_fill  # type: ignore[index]
 
     with pytest.raises(ProfileError, match="proof_fill"):
+        FirmwareProfile.from_dict(raw)
+
+
+def test_profile_rejects_non_paper_proof_fill(
+    profile_580_105_raw: dict[str, object],
+) -> None:
+    raw = copy.deepcopy(profile_580_105_raw)
+    raw["exploit"]["proof_fill"] = "0x1234"  # type: ignore[index]
+
+    with pytest.raises(ProfileError, match="paper's 0x4a7"):
         FirmwareProfile.from_dict(raw)
 
 

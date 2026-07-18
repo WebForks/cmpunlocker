@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -64,6 +65,99 @@ def test_cli_refuses_to_overwrite_payload_without_force(
     assert raised.value.code == 2
     assert output.read_bytes() == b"keep me"
     assert "pass --force to replace it" in captured.err
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_cli_never_patches_firmware_input_in_place(
+    local_tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    force: bool,
+) -> None:
+    firmware = local_tmp_path / "stock.bin"
+    stock = b"not even parsed because the path check runs first"
+    firmware.write_bytes(stock)
+    arguments = ["firmware", "patch", str(firmware), str(firmware)]
+    if force:
+        arguments.append("--force")
+
+    with pytest.raises(SystemExit) as raised:
+        main(arguments)
+
+    captured = capsys.readouterr()
+    assert raised.value.code == 2
+    assert firmware.read_bytes() == stock
+    assert "input and output refer to the same file" in captured.err
+
+
+def test_cli_rejects_hardlink_alias_of_firmware_input(
+    local_tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    firmware = local_tmp_path / "stock.bin"
+    alias = local_tmp_path / "output.bin"
+    stock = b"stock remains intact"
+    firmware.write_bytes(stock)
+    os.link(firmware, alias)
+
+    with pytest.raises(SystemExit) as raised:
+        main(["firmware", "patch", str(firmware), str(alias), "--force"])
+
+    captured = capsys.readouterr()
+    assert raised.value.code == 2
+    assert firmware.read_bytes() == stock
+    assert alias.read_bytes() == stock
+    assert "input and output refer to the same file" in captured.err
+
+
+def test_cli_rejects_symlink_alias_of_firmware_input(
+    local_tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    firmware = local_tmp_path / "stock.bin"
+    alias = local_tmp_path / "output.bin"
+    stock = b"stock remains intact"
+    firmware.write_bytes(stock)
+    try:
+        alias.symlink_to(firmware)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+
+    with pytest.raises(SystemExit) as raised:
+        main(["firmware", "patch", str(firmware), str(alias), "--force"])
+
+    captured = capsys.readouterr()
+    assert raised.value.code == 2
+    assert firmware.read_bytes() == stock
+    assert "input and output refer to the same file" in captured.err
+
+
+def test_cli_refuses_to_follow_distinct_output_symlink(
+    local_tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    target = local_tmp_path / "target.bin"
+    output = local_tmp_path / "payload.bin"
+    target.write_bytes(b"do not replace")
+    try:
+        output.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"symlinks are unavailable: {exc}")
+
+    with pytest.raises(SystemExit) as raised:
+        main(
+            [
+                "payload",
+                "build",
+                str(output),
+                "--profile",
+                "580.105.08",
+                "--mode",
+                "proof",
+                "--force",
+            ]
+        )
+
+    captured = capsys.readouterr()
+    assert raised.value.code == 2
+    assert target.read_bytes() == b"do not replace"
+    assert "output path is a symlink" in captured.err
 
 
 def test_cli_system_apply_is_inert_without_execute(

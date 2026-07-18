@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import tempfile
@@ -122,13 +123,32 @@ def _copy_xattrs(source: Path, destination: Path) -> None:
     if not all(hasattr(os, name) for name in ("listxattr", "getxattr", "setxattr")):
         return
     try:
-        for name in os.listxattr(source):
+        names = os.listxattr(source)
+    except OSError as exc:
+        unsupported = {
+            errno.ENOSYS,
+            getattr(errno, "ENOTSUP", -1),
+            getattr(errno, "EOPNOTSUPP", -1),
+        }
+        if exc.errno in unsupported:
+            return
+        raise FirmwareError(f"cannot list metadata attributes on {source}: {exc}") from exc
+    for name in names:
+        try:
             os.setxattr(destination, name, os.getxattr(source, name))
-    except OSError:
-        pass
+        except OSError as exc:
+            raise FirmwareError(
+                f"cannot preserve metadata attribute {name!r} from {source}: {exc}"
+            ) from exc
 
 
-def atomic_replace_bytes(path: Path, data: bytes, *, metadata_from: Path | None = None) -> None:
+def atomic_replace_bytes(
+    path: Path,
+    data: bytes,
+    *,
+    metadata_from: Path | None = None,
+    mode: int | None = None,
+) -> None:
     path = path.resolve()
     source = metadata_from.resolve() if metadata_from is not None else path
     fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -146,8 +166,22 @@ def atomic_replace_bytes(path: Path, data: bytes, *, metadata_from: Path | None 
             except (AttributeError, PermissionError):
                 pass
             _copy_xattrs(source, temporary)
+        if mode is not None:
+            os.chmod(temporary, mode)
+        # chmod/chown/xattr updates dirty the inode after the data fsync above.
+        # Sync again so a durable rename cannot expose content without its final
+        # permissions or security metadata.
+        # Windows rejects fsync on a read-only descriptor; r+b works on both
+        # supported host families without changing the file contents.
+        with temporary.open("r+b") as handle:
+            os.fsync(handle.fileno())
         os.replace(temporary, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+        except OSError:
+            if os.name == "nt":
+                return
+            raise
         try:
             os.fsync(directory_fd)
         finally:

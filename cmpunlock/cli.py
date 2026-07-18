@@ -9,7 +9,12 @@ from pathlib import Path
 from typing import Any
 
 from .errors import CmpUnlockError, FirmwareError, ProfileError
-from .firmware import inspect_firmware, patch_firmware, validate_stock_firmware
+from .firmware import (
+    atomic_replace_bytes,
+    inspect_firmware,
+    patch_firmware,
+    validate_stock_firmware,
+)
 from .payload import build_payload
 from .profile import (
     FirmwareProfile,
@@ -20,6 +25,7 @@ from .profile import (
 from .system import (
     ACKNOWLEDGEMENT,
     build_apply_plan,
+    clear_state,
     experimental_apply,
     inspect_system,
     recover_firmware,
@@ -41,12 +47,25 @@ def _profile(value: str | None, firmware: Path | None = None) -> FirmwareProfile
 
 
 def _write_new(path: Path, data: bytes, force: bool) -> None:
+    if path.is_symlink():
+        raise FirmwareError(f"output path is a symlink: {path}; refusing to follow it")
     if path.exists() and not force:
         raise FirmwareError(f"output exists: {path}; pass --force to replace it")
     path.parent.mkdir(parents=True, exist_ok=True)
-    mode = "wb" if force else "xb"
-    with path.open(mode) as handle:
+    if force:
+        atomic_replace_bytes(path, data, metadata_from=path if path.exists() else None)
+        return
+    with path.open("xb") as handle:
         handle.write(data)
+
+
+def _same_file(left: Path, right: Path) -> bool:
+    try:
+        return left.samefile(right)
+    except FileNotFoundError:
+        return left.resolve() == right.resolve()
+    except OSError as exc:
+        raise FirmwareError(f"cannot compare input and output paths: {exc}") from exc
 
 
 def command_profile_list(_args: argparse.Namespace) -> None:
@@ -106,16 +125,19 @@ def command_payload_build(args: argparse.Namespace) -> None:
 
 def command_firmware_patch(args: argparse.Namespace) -> None:
     input_path = Path(args.input)
+    output_path = Path(args.output)
+    if _same_file(input_path, output_path):
+        raise FirmwareError("input and output refer to the same file; refusing to overwrite stock")
     profile = _profile(args.profile, input_path)
     source = input_path.read_bytes()
     payload, payload_report = build_payload(profile, args.mode)
     patched, report = patch_firmware(source, payload, payload_report, profile)
-    _write_new(Path(args.output), patched, args.force)
+    _write_new(output_path, patched, args.force)
     result = report.as_dict()
     result.update(
         {
             "input": str(input_path.resolve()),
-            "output": str(Path(args.output).resolve()),
+            "output": str(output_path.resolve()),
             "profile": profile.profile_id,
             "hardware_verified": False,
         }
@@ -153,6 +175,15 @@ def command_system_apply(args: argparse.Namespace) -> None:
 
 def command_system_recover(args: argparse.Namespace) -> None:
     _json(recover_firmware(Path(args.firmware)))
+
+
+def command_system_state_clear(args: argparse.Namespace) -> None:
+    _json(
+        clear_state(
+            Path(args.firmware),
+            acknowledgement=args.acknowledge,
+        )
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -193,7 +224,9 @@ def build_parser() -> argparse.ArgumentParser:
     payload_build.add_argument("--force", action="store_true")
     payload_build.set_defaults(func=command_payload_build)
 
-    system = subcommands.add_parser("system", help="read-only live-host checks and recovery")
+    system = subcommands.add_parser(
+        "system", help="live-host checks, gated execution, and recovery"
+    )
     system_commands = system.add_subparsers(dest="system_command", required=True)
     for name, help_text, func in (
         ("inspect", "verify target, firmware, module, and embedded booter", command_system_inspect),
@@ -217,9 +250,19 @@ def build_parser() -> argparse.ArgumentParser:
     apply.add_argument("--settle-seconds", type=float, default=5.0)
     apply.set_defaults(func=command_system_apply)
 
-    recover = system_commands.add_parser("recover", help="restore stock firmware from a journal")
+    recover = system_commands.add_parser(
+        "recover", help="restore verified stock firmware from a journal"
+    )
     recover.add_argument("--firmware", required=True)
     recover.set_defaults(func=command_system_recover)
+
+    state_clear = system_commands.add_parser(
+        "state-clear",
+        help="clear an audit record after a confirmed complete cold power cycle",
+    )
+    state_clear.add_argument("--firmware", required=True)
+    state_clear.add_argument("--acknowledge", default="")
+    state_clear.set_defaults(func=command_system_state_clear)
     return parser
 
 
