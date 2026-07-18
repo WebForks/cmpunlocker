@@ -1,15 +1,15 @@
 {
   "schema_version": 1,
-  "profile_id": "ga100-580.105.08-community-experimental",
-  "evidence": "community-unverified",
-  "driver_version": "580.105.08",
+  "profile_id": "ga100-580.173.02-community-reported",
+  "evidence": "community-reported-hardware",
+  "driver_version": "580.173.02",
   "firmware": {
-    "size": 30327896,
-    "sha256": "84e0f47adc5b7f40a5789f1e3d528ca1269bd6184029dec0af6c76f9f282d0d7",
+    "size": 30471256,
+    "sha256": "6f3ccbd570c7ac2a7ea910d9d87fc3d23db9ae3dfe82020ea07b17a30954495e",
     "signature_section": ".fwsignature_ga100",
-    "signature_offset": "0x1ce8f0f",
+    "signature_offset": "0x1d0bf0f",
     "signature_size": "0x1000",
-    "signature_sha256": "1815c63178d5635025e03555fb63a6cf4dc2d1b809767309575e49781ff92b8c"
+    "signature_sha256": "f259fed6a47aba40df33d159b4390e996e455f8ad3bceb43bcbdd99d11a13fec"
   },
   "booter": {
     "size": 60160,
@@ -18,7 +18,7 @@
     "sha256": "edacea964e7199268b031ac0baac60358eb6845b38456c0b3e7dc8e2c35daf86"
   },
   "device": {
-    "accepted_pci_device_ids": ["2082", "20c2"]
+    "accepted_pci_device_ids": ["20c2"]
   },
   "exploit": {
     "dma_target": "0x0800",
@@ -32,9 +32,9 @@
     "bar0_write_gadget": "0x10b9",
     "tail_return": "0x810d",
     "hs_writes": [
-      {"name": "FEAT_OVR_PLM", "address": "0x00823804", "value": "0xffffffff"},
-      {"name": "FEAT_OVR_PLM repeat 1", "address": "0x00823804", "value": "0xffffffff"},
-      {"name": "FEAT_OVR_PLM repeat 2", "address": "0x00823804", "value": "0xffffffff"}
+      {"name": "FBPA_CFG1_UNVERIFIED", "address": "0x009a0204", "value": "0x02779000"},
+      {"name": "LMR_UNVERIFIED", "address": "0x00100ce0", "value": "0x0000020b"},
+      {"name": "FEAT_OVR_PLM", "address": "0x00823804", "value": "0xffffffff"}
     ]
   },
   "compute": {
@@ -46,6 +46,6 @@
     ]
   },
   "execution": {
-    "strategy": "legacy-compute-only"
+    "strategy": "reported-two-phase"
   }
 }

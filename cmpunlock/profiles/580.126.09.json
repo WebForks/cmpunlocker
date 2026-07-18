@@ -44,5 +44,8 @@
       {"name": "FEAT_OVR_SM_SPD", "address": "0x0082381c", "value": "0x88888888"},
       {"name": "FEAT_OVR_SM_SPD_1", "address": "0x00823820", "value": "0x00000008"}
     ]
+  },
+  "execution": {
+    "strategy": "legacy-compute-only"
   }
 }

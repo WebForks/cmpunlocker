@@ -22,8 +22,19 @@ def profile_580_105():
 
 
 @pytest.fixture
+def profile_580_173():
+    return load_profile("580.173.02")
+
+
+@pytest.fixture
 def profile_580_105_raw() -> dict[str, object]:
     path = Path(__file__).parents[1] / "cmpunlock" / "profiles" / "580.105.08.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+@pytest.fixture
+def profile_580_173_raw() -> dict[str, object]:
+    path = Path(__file__).parents[1] / "cmpunlock" / "profiles" / "580.173.02.json"
     return json.loads(path.read_text(encoding="utf-8"))
 
 

@@ -86,6 +86,7 @@ class FirmwareProfile:
     host_writes: tuple[RegisterWrite, ...]
     plm_readback_address: int
     plm_open_value: int
+    execution_strategy: str
 
     @classmethod
     def from_dict(cls, raw: Any) -> "FirmwareProfile":
@@ -105,12 +106,14 @@ class FirmwareProfile:
         device = raw.get("device")
         exploit = raw.get("exploit")
         compute = raw.get("compute")
+        execution = raw.get("execution", {})
         for name, value in (
             ("firmware", firmware),
             ("booter", booter),
             ("device", device),
             ("exploit", exploit),
             ("compute", compute),
+            ("execution", execution),
         ):
             if not isinstance(value, dict):
                 raise ProfileError(f"{name} must be an object")
@@ -200,13 +203,22 @@ class FirmwareProfile:
                 compute.get("plm_readback_address"), "compute.plm_readback_address"
             ),
             plm_open_value=parse_int(compute.get("plm_open_value"), "compute.plm_open_value"),
+            execution_strategy=str(execution.get("strategy", "legacy-compute-only")),
         )
         profile.validate()
         return profile
 
     def validate(self) -> None:
-        if self.evidence not in {"paper-proof", "community-unverified"}:
+        if self.evidence not in {
+            "paper-proof",
+            "community-unverified",
+            "community-reported-hardware",
+        }:
             raise ProfileError(f"unknown evidence level: {self.evidence}")
+        if self.execution_strategy not in {"legacy-compute-only", "reported-two-phase"}:
+            raise ProfileError(
+                f"unknown execution strategy: {self.execution_strategy}"
+            )
         if not self.signature_section:
             raise ProfileError("firmware.signature_section must be non-empty")
         if self.firmware_size <= 0 or self.signature_size <= 0 or self.signature_offset < 0:
@@ -271,6 +283,7 @@ class FirmwareProfile:
             "firmware_sha256": self.firmware_sha256,
             "booter_sha256": self.booter_sha256,
             "accepted_pci_device_ids": list(self.accepted_device_ids),
+            "execution_strategy": self.execution_strategy,
         }
 
 

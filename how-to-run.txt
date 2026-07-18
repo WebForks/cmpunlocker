@@ -15,5 +15,7 @@ benchmark, and cooling procedure is maintained in README.md. Read it in full
 before using any `cmpunlock system` command. This file intentionally does not
 duplicate the hazardous command sequence so the two guides cannot diverge.
 
-Status: the paper proof bytes are reproduced offline; the productive continuation
-and compute registers remain community-derived and hardware-unverified.
+Status: the paper proof bytes are reproduced offline. One external 580.173.02/20c2
+run reports a compute result, but this project has not independently reproduced it
+and the same report says memory remained at 8 GiB. See README.md for the exact
+evidence boundary and the separately pinned reported strategy.

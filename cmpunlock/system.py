@@ -30,7 +30,7 @@ except ImportError:  # Offline commands are supported on non-POSIX hosts.
 from .errors import ApplyError, SystemCheckError
 from .firmware import atomic_replace_bytes, patch_firmware, sha256_bytes, validate_stock_firmware
 from .payload import build_compute_payload
-from .profile import FirmwareProfile, bundled_profile_paths, load_profile
+from .profile import FirmwareProfile, RegisterWrite, bundled_profile_paths, load_profile
 
 
 _BDF = re.compile(
@@ -45,8 +45,12 @@ _NVIDIA_MODULES = {
     "nvidia_peermem",
 }
 _ACKNOWLEDGEMENT = "UNVERIFIED-CMP170HX-EXPERIMENT"
+_REPORTED_PATH_ACKNOWLEDGEMENT = (
+    "UNVERIFIED-CMP170HX-REPORTED-PATH-WITH-MEMORY-SIDE-EFFECTS"
+)
 _COLD_CYCLE_ACKNOWLEDGEMENT = "COLD-POWER-CYCLE-COMPLETED"
 _CMP_DEVICE_IDS = frozenset({"2082", "20c2"})
+_REPORTED_PROFILE_ID = "ga100-580.173.02-community-reported"
 _LIVE_EXPLOIT_CONTRACT = (
     0x0800,
     0xF800,
@@ -58,9 +62,14 @@ _LIVE_EXPLOIT_CONTRACT = (
     0x10B9,
     0x810D,
 )
-_LIVE_HS_WRITES = (
+_LEGACY_COMPUTE_ONLY_HS_WRITES = (
     (0x00823804, 0xFFFFFFFF),
     (0x00823804, 0xFFFFFFFF),
+    (0x00823804, 0xFFFFFFFF),
+)
+_REPORTED_HS_WRITES = (
+    (0x009A0204, 0x02779000),
+    (0x00100CE0, 0x0000020B),
     (0x00823804, 0xFFFFFFFF),
 )
 _LIVE_HOST_WRITES = (
@@ -86,13 +95,21 @@ def normalize_bdf(value: str) -> str:
 
 
 def validate_live_profile(profile: FirmwareProfile) -> None:
-    """Restrict live operations to the reviewed, bundled compute-only contract."""
+    """Restrict live operations to the reviewed, bundled live contracts."""
     if not any(profile == load_profile(path) for path in bundled_profile_paths()):
         raise SystemCheckError(
             "live system commands require an unchanged bundled firmware profile"
         )
-    if frozenset(profile.accepted_device_ids) != _CMP_DEVICE_IDS:
-        raise SystemCheckError("live profile does not contain the reviewed CMP device IDs")
+    reported = profile.execution_strategy == "reported-two-phase"
+    expected_ids = frozenset({"20c2"}) if reported else _CMP_DEVICE_IDS
+    if frozenset(profile.accepted_device_ids) != expected_ids:
+        raise SystemCheckError("live profile changes the reviewed CMP device-ID contract")
+    if reported and (
+        profile.profile_id != _REPORTED_PROFILE_ID
+        or profile.driver_version != "580.173.02"
+        or profile.evidence != "community-reported-hardware"
+    ):
+        raise SystemCheckError("reported two-phase execution is pinned to 580.173.02")
     exploit_contract = (
         profile.dma_target,
         profile.payload_size,
@@ -107,7 +124,10 @@ def validate_live_profile(profile: FirmwareProfile) -> None:
     if exploit_contract != _LIVE_EXPLOIT_CONTRACT:
         raise SystemCheckError("live profile changes the reviewed exploit contract")
     hs_writes = tuple((write.address, write.value) for write in profile.hs_writes)
-    if hs_writes != _LIVE_HS_WRITES:
+    expected_hs_writes = (
+        _REPORTED_HS_WRITES if reported else _LEGACY_COMPUTE_ONLY_HS_WRITES
+    )
+    if hs_writes != expected_hs_writes:
         raise SystemCheckError("live profile changes the reviewed Heavy Secure writes")
     host_writes = tuple((write.address, write.value) for write in profile.host_writes)
     if host_writes != _LIVE_HOST_WRITES:
@@ -203,6 +223,7 @@ def validate_target(device: PciDevice, profile: FirmwareProfile) -> None:
     if device.resource0_size < max(
         profile.plm_readback_address,
         *(write.address for write in profile.host_writes),
+        *(write.address for write in profile.hs_writes),
     ) + 4:
         raise SystemCheckError("BAR0 is too small for the profiled register offsets")
 
@@ -230,7 +251,12 @@ def loaded_nvidia_modules(proc_modules: Path = Path("/proc/modules")) -> tuple[s
     return tuple(sorted(loaded & _NVIDIA_MODULES))
 
 
-def _run(command: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+def _run(
+    command: list[str],
+    *,
+    check: bool = True,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
             command,
@@ -238,12 +264,92 @@ def _run(command: list[str], *, check: bool = True) -> subprocess.CompletedProce
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            timeout=timeout,
         )
     except FileNotFoundError as exc:
         raise SystemCheckError(f"required command is missing: {command[0]}") from exc
     except subprocess.CalledProcessError as exc:
         detail = exc.stderr.strip() or exc.stdout.strip() or f"exit {exc.returncode}"
         raise ApplyError(f"command failed ({' '.join(command)}): {detail}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise ApplyError(
+            f"command timed out after {timeout:g}s ({' '.join(command)})"
+        ) from exc
+
+
+def _require_nvidia_smi() -> str:
+    path = shutil.which("nvidia-smi")
+    if path is None:
+        raise SystemCheckError(
+            "nvidia-smi is required to trigger and verify GPU initialization"
+        )
+    return str(Path(path).resolve())
+
+
+def _nvidia_smi_command(bdf: str, executable: str) -> list[str]:
+    return [
+        executable,
+        "--id=" + bdf,
+        "--query-gpu=pci.bus_id",
+        "--format=csv,noheader",
+    ]
+
+
+def _bounded_output(value: str, limit: int = 512) -> str:
+    value = value.strip()
+    return value if len(value) <= limit else value[-limit:]
+
+
+def _probe_patched_gpu(
+    bdf: str,
+    executable: str,
+    *,
+    timeout: float = 15.0,
+) -> dict[str, Any]:
+    command = _nvidia_smi_command(bdf, executable)
+    try:
+        result = _run(command, check=False, timeout=timeout)
+    except ApplyError as exc:
+        # Patched GSP initialization may intentionally fail. A timeout or
+        # nonzero result is diagnostic; PLM readback is the mandatory gate.
+        return {
+            "command": command,
+            "returncode": None,
+            "timed_out": True,
+            "detail": str(exc),
+        }
+    return {
+        "command": command,
+        "returncode": result.returncode,
+        "timed_out": False,
+        "stdout": _bounded_output(result.stdout),
+        "stderr": _bounded_output(result.stderr),
+    }
+
+
+def _probe_stock_gpu(
+    bdf: str,
+    executable: str,
+    *,
+    timeout: float = 15.0,
+) -> dict[str, Any]:
+    command = _nvidia_smi_command(bdf, executable)
+    result = _run(command, timeout=timeout)
+    return {
+        "command": command,
+        "returncode": result.returncode,
+        "timed_out": False,
+        "stdout": _bounded_output(result.stdout),
+        "stderr": _bounded_output(result.stderr),
+    }
+
+
+def _diagnostic_hs_writes(profile: FirmwareProfile) -> tuple[RegisterWrite, ...]:
+    return tuple(
+        write
+        for write in profile.hs_writes
+        if write.address != profile.plm_readback_address
+    )
 
 
 def module_info() -> tuple[str, Path]:
@@ -408,6 +514,8 @@ def inspect_system(
         raise SystemCheckError(f"cannot read firmware {firmware_path}: {exc}") from exc
     validate_stock_firmware(firmware, profile)
     module = validate_module(profile)
+    nvidia_smi = _require_nvidia_smi()
+    stock_probe = _probe_stock_gpu(normalize_bdf(bdf), nvidia_smi)
     return {
         "device": device.as_dict(),
         "nvidia_devices": list(enumerate_nvidia_devices(sysfs_root)),
@@ -418,12 +526,19 @@ def inspect_system(
             "sha256": sha256_bytes(firmware),
         },
         "module": module,
+        "nvidia_smi": {
+            "path": nvidia_smi,
+            "stock_probe": stock_probe,
+        },
         "profile": profile.to_summary(),
         "experimental_apply_available": True,
         "hardware_verified": False,
         "warning": (
-            "community continuation addresses have no published decrypted disassembly "
-            "or hardware trace"
+            "580.173.02 has one community hardware report but no independently "
+            "reproduced trace or benchmark artifact"
+            if profile.execution_strategy == "reported-two-phase"
+            else "community continuation addresses have no published decrypted "
+            "disassembly or hardware trace"
         ),
     }
 
@@ -435,27 +550,54 @@ def build_apply_plan(
     payload, payload_report = build_compute_payload(profile)
     source = firmware_path.read_bytes()
     _patched, patch_report = patch_firmware(source, payload, payload_report, profile)
+    if profile.execution_strategy == "reported-two-phase":
+        planned_stages = [
+            "verify exact 20c2 device, 580.173.02 firmware/module, and embedded booter",
+            "require one idle NVIDIA GPU, all NVIDIA modules unloaded, and nvidia-smi",
+            "record PLM, compute, FBPA, and LMR baselines",
+            "write a durable stock-firmware backup and transaction journal",
+            "atomically install the patched GSP image",
+            "load nvidia and run a bounded best-effort nvidia-smi initialization probe",
+            "issue FLR #1, unload nvidia cleanly, restore stock, then issue FLR #2",
+            "require FEAT_OVR_PLM all-open readback after both resets",
+            "record FBPA/LMR diagnostically and write only the two compute overrides",
+            "load stock nvidia without force removal",
+            "require stock nvidia-smi success and verify compute override readback",
+        ]
+    else:
+        planned_stages = [
+            "verify exact CMP PCI ID, firmware, driver version, and embedded booter hash",
+            "require a single idle NVIDIA GPU and all NVIDIA modules unloaded",
+            "write a durable stock-firmware backup and transaction journal",
+            "atomically install the patched GSP image",
+            "load nvidia and run a bounded best-effort nvidia-smi initialization probe",
+            "require a changed FEAT_OVR_PLM readback consistent with the HS continuation",
+            "write and verify only the two compute-rate overrides",
+            "unload nvidia cleanly, restore stock firmware, issue FLR, and load stock nvidia",
+            "require stock nvidia-smi success and verify override readback",
+        ]
     return {
         "status": "experimental-unverified",
         "device": normalize_bdf(bdf),
         "firmware": str(firmware_path.resolve()),
         "profile": profile.to_summary(),
         "patch": patch_report.as_dict(),
-        "planned_stages": [
-            "verify exact CMP PCI ID, firmware, driver version, and embedded booter hash",
-            "require a single idle NVIDIA GPU and all NVIDIA modules unloaded",
-            "write a durable stock-firmware backup and transaction journal",
-            "atomically install the patched GSP image",
-            "load nvidia to enter the vulnerable GA100 booter",
-            "require a changed FEAT_OVR_PLM readback consistent with the HS continuation",
-            "write and verify only the two compute-rate overrides",
-            "unload nvidia cleanly, restore stock firmware, issue FLR, and load stock nvidia",
-            "verify override readback after the stock reload",
-        ],
+        "planned_stages": planned_stages,
+        "required_acknowledgement": (
+            _REPORTED_PATH_ACKNOWLEDGEMENT
+            if profile.execution_strategy == "reported-two-phase"
+            else _ACKNOWLEDGEMENT
+        ),
+        "memory_capacity_verified": False,
         "automatic_execute": False,
         "unresolved_evidence": (
-            "main.pdf omits the productive continuation and the public 0x10b9/0x810d "
-            "addresses are inside encrypted Falcon IMEM with no published derivation"
+            "one 580.173.02/20c2 community report reached compute, but it publishes "
+            "no decrypted derivation or independently reproducible trace and reports "
+            "that memory remained at 8 GiB"
+            if profile.execution_strategy == "reported-two-phase"
+            else "main.pdf omits the productive continuation and the public "
+            "0x10b9/0x810d addresses are inside encrypted Falcon IMEM with no "
+            "published derivation"
         ),
     }
 
@@ -748,8 +890,14 @@ def experimental_apply(
 ) -> dict[str, Any]:
     require_linux()
     validate_live_profile(profile)
-    if acknowledgement != _ACKNOWLEDGEMENT:
-        raise ApplyError(f"execution requires --acknowledge {_ACKNOWLEDGEMENT}")
+    reported_two_phase = profile.execution_strategy == "reported-two-phase"
+    required_acknowledgement = (
+        _REPORTED_PATH_ACKNOWLEDGEMENT if reported_two_phase else _ACKNOWLEDGEMENT
+    )
+    if acknowledgement != required_acknowledgement:
+        raise ApplyError(
+            f"execution requires --acknowledge {required_acknowledgement}"
+        )
     if os.geteuid() != 0:
         raise ApplyError("experimental apply must run as root")
     if not math.isfinite(settle_seconds) or settle_seconds < 0:
@@ -771,6 +919,7 @@ def experimental_apply(
             "NVIDIA modules must be unloaded before execution; still loaded: " + ", ".join(loaded)
         )
     validate_module(profile)
+    nvidia_smi = _require_nvidia_smi()
 
     firmware_path = firmware_path.resolve()
     stock = firmware_path.read_bytes()
@@ -815,6 +964,10 @@ def experimental_apply(
                     write.name: f"0x{bar0.read32(write.address):08x}"
                     for write in profile.host_writes
                 },
+                **{
+                    write.name: f"0x{bar0.read32(write.address):08x}"
+                    for write in _diagnostic_hs_writes(profile)
+                },
             }
         if baseline_registers["FEAT_OVR_PLM"] == f"0x{profile.plm_open_value:08x}":
             raise ApplyError(
@@ -846,10 +999,16 @@ def experimental_apply(
         overrides_ever_attempted = False
         old_values: dict[int, int] = {}
         register_results: dict[str, str] = {}
+        patched_probe_result: dict[str, Any] | None = None
+        stock_probe_result: dict[str, Any] | None = None
+        stock_module_loaded = False
         stage = "prepared"
         primary_error: BaseException | None = None
 
         def write_state(error: BaseException | None = None) -> None:
+            reported_hs_side_effects_may_be_active = (
+                reported_two_phase and patched_boot_attempted
+            )
             _write_journal(
                 state_path,
                 {
@@ -862,18 +1021,69 @@ def experimental_apply(
                     "error": (
                         f"{type(error).__name__}: {error}" if error is not None else None
                     ),
+                    "execution_strategy": profile.execution_strategy,
                     "firmware": str(firmware_path),
                     "firmware_restored": firmware_restored,
-                    "override_state_may_be_active": overrides_active,
+                    "memory_capacity_verified": False,
+                    "host_compute_overrides_may_be_active": overrides_active,
+                    "override_state_may_be_active": (
+                        overrides_active or reported_hs_side_effects_may_be_active
+                    ),
                     "patched_firmware_boot_attempted": patched_boot_attempted,
+                    "patched_gpu_initialization_probe": patched_probe_result,
                     "patched_module_may_be_loaded": module_loaded,
                     "profile": profile.profile_id,
+                    "reported_hs_side_effects_may_be_active": (
+                        reported_hs_side_effects_may_be_active
+                    ),
                     "patched_sha256": patch_report.patched_sha256,
                     "registers": register_results,
                     "stage": stage,
+                    "stock_gpu_verification": stock_probe_result,
+                    "stock_module_may_be_loaded": stock_module_loaded,
                     "stock_sha256": profile.firmware_sha256,
                 },
             )
+
+        def restore_stock_on_disk() -> None:
+            nonlocal firmware_restored
+            atomic_replace_bytes(firmware_path, stock, metadata_from=firmware_path)
+            firmware_restored = True
+
+        def apply_compute_overrides(active: PciDevice, phase: str) -> None:
+            nonlocal overrides_active, overrides_ever_attempted, stage
+            with Bar0(active, sysfs_root) as bar0:
+                plm = bar0.read32(profile.plm_readback_address)
+                register_results[f"{phase}_FEAT_OVR_PLM"] = f"0x{plm:08x}"
+                if plm != profile.plm_open_value:
+                    raise ApplyError(
+                        "HS continuation readback gate failed: FEAT_OVR_PLM read "
+                        f"0x{plm:08x}, expected 0x{profile.plm_open_value:08x}"
+                    )
+                for diagnostic in _diagnostic_hs_writes(profile):
+                    value = bar0.read32(diagnostic.address)
+                    register_results[f"{phase}_{diagnostic.name}"] = f"0x{value:08x}"
+                stage = "override-write-started"
+                overrides_active = True
+                overrides_ever_attempted = True
+                write_state()
+                try:
+                    for write in profile.host_writes:
+                        old_values[write.address] = bar0.read32(write.address)
+                        bar0.write32(write.address, write.value)
+                        readback = bar0.read32(write.address)
+                        register_results[write.name] = f"0x{readback:08x}"
+                        if readback != write.value:
+                            raise ApplyError(
+                                f"{write.name} did not stick: read 0x{readback:08x}, "
+                                f"expected 0x{write.value:08x}"
+                            )
+                    stage = "overrides-written"
+                    write_state()
+                except BaseException:
+                    if _restore_registers(bar0, old_values):
+                        overrides_active = False
+                    raise
 
         try:
             try:
@@ -886,51 +1096,50 @@ def experimental_apply(
                 write_state()
                 module_loaded = True
                 _run(["modprobe", "nvidia"])
-                stage = "patched-module-loaded"
+                stage = "patched-module-load-returned"
+                write_state()
+                patched_probe_result = _probe_patched_gpu(normalized, nvidia_smi)
+                stage = "patched-gpu-probe-complete"
+                write_state()
                 time.sleep(settle_seconds)
 
-                active = inspect_pci_device(normalized, sysfs_root)
-                if active.driver != "nvidia":
-                    raise ApplyError(
-                        f"target did not bind to nvidia after module load: {active.driver}"
-                    )
-                with Bar0(active, sysfs_root) as bar0:
-                    plm = bar0.read32(profile.plm_readback_address)
-                    register_results["FEAT_OVR_PLM"] = f"0x{plm:08x}"
-                    if plm != profile.plm_open_value:
-                        raise ApplyError(
-                            "HS continuation readback gate failed: FEAT_OVR_PLM read "
-                            f"0x{plm:08x}, expected 0x{profile.plm_open_value:08x}"
-                        )
-                    stage = "override-write-started"
-                    overrides_active = True
-                    overrides_ever_attempted = True
+                if reported_two_phase:
+                    _reset_device(normalized, sysfs_root)
+                    stage = "reported-flr-1-complete"
                     write_state()
-                    try:
-                        for write in profile.host_writes:
-                            old_values[write.address] = bar0.read32(write.address)
-                            bar0.write32(write.address, write.value)
-                            readback = bar0.read32(write.address)
-                            register_results[write.name] = f"0x{readback:08x}"
-                            if readback != write.value:
-                                raise ApplyError(
-                                    f"{write.name} did not stick: read 0x{readback:08x}, "
-                                    f"expected 0x{write.value:08x}"
-                                )
-                        stage = "overrides-written"
-                        write_state()
-                    except BaseException:
-                        if _restore_registers(bar0, old_values):
-                            overrides_active = False
-                        raise
-
-                _run(["modprobe", "-r", "nvidia"])
-                module_loaded = False
-                stage = "patched-module-unloaded"
-                write_state()
+                    time.sleep(settle_seconds)
+                    _run(["modprobe", "-r", "nvidia"])
+                    module_loaded = False
+                    stage = "patched-module-unloaded"
+                    write_state()
+                    restore_stock_on_disk()
+                    stage = "stock-firmware-restored-after-patched-unload"
+                    write_state()
+                    _reset_device(normalized, sysfs_root)
+                    stage = "reported-flr-2-complete"
+                    write_state()
+                    time.sleep(settle_seconds)
+                    active = inspect_pci_device(normalized, sysfs_root)
+                    if active.driver is not None:
+                        raise ApplyError(
+                            "target rebound unexpectedly after the clean patched-module "
+                            f"unload: {active.driver}"
+                        )
+                    apply_compute_overrides(active, "post_reported_flr")
+                else:
+                    active = inspect_pci_device(normalized, sysfs_root)
+                    if active.driver != "nvidia":
+                        raise ApplyError(
+                            f"target did not bind to nvidia after module load: {active.driver}"
+                        )
+                    apply_compute_overrides(active, "patched_boot")
+                    _run(["modprobe", "-r", "nvidia"])
+                    module_loaded = False
+                    stage = "patched-module-unloaded"
+                    write_state()
             except BaseException as exc:
                 primary_error = exc
-                if overrides_active and module_loaded and old_values:
+                if overrides_active and old_values:
                     try:
                         active = inspect_pci_device(normalized, sysfs_root)
                         with Bar0(active, sysfs_root) as bar0:
@@ -947,12 +1156,12 @@ def experimental_apply(
                 except BaseException as exc:
                     if primary_error is None:
                         primary_error = exc
-            try:
-                atomic_replace_bytes(firmware_path, stock, metadata_from=firmware_path)
-                firmware_restored = True
-            except BaseException as exc:
-                if primary_error is None:
-                    primary_error = exc
+            if not firmware_restored:
+                try:
+                    restore_stock_on_disk()
+                except BaseException as exc:
+                    if primary_error is None:
+                        primary_error = exc
             if (
                 patched_boot_attempted
                 or overrides_ever_attempted
@@ -989,15 +1198,24 @@ def experimental_apply(
             raise ApplyError("compute overrides were not left active")
 
         try:
-            _reset_device(normalized, sysfs_root)
-            stage = "flr-complete"
+            if reported_two_phase:
+                stage = "stock-firmware-ready-after-reported-flrs"
+            else:
+                _reset_device(normalized, sysfs_root)
+                stage = "flr-complete"
+            write_state()
+            stock_module_loaded = True
+            stage = "stock-module-load-attempting"
             write_state()
             _run(["modprobe", "nvidia"])
+            stage = "stock-module-load-returned"
+            write_state()
             time.sleep(settle_seconds)
+            stock_probe_result = _probe_stock_gpu(normalized, nvidia_smi)
             final_device = inspect_pci_device(normalized, sysfs_root)
             if final_device.driver != "nvidia":
                 raise ApplyError(
-                    "target did not bind to the stock nvidia driver after FLR: "
+                    "target did not bind to the stock nvidia driver after restoration: "
                     f"{final_device.driver}"
                 )
             stage = "stock-driver-loaded"
@@ -1010,6 +1228,11 @@ def experimental_apply(
                         raise ApplyError(
                             f"{write.name} did not persist across FLR/stock reload: 0x{value:08x}"
                         )
+                for diagnostic in _diagnostic_hs_writes(profile):
+                    value = bar0.read32(diagnostic.address)
+                    register_results[
+                        f"post_reload_{diagnostic.name}"
+                    ] = f"0x{value:08x}"
             stage = "complete"
             write_state()
         except BaseException as exc:
@@ -1025,12 +1248,16 @@ def experimental_apply(
         return {
             "status": "register-readback-passed",
             "hardware_performance_verified": False,
+            "memory_capacity_verified": False,
             "bdf": normalized,
             "profile": profile.profile_id,
+            "execution_strategy": profile.execution_strategy,
             "firmware_restored_sha256": sha256_bytes(firmware_path.read_bytes()),
             "backup": str(backup),
             "baseline_registers": baseline_registers,
             "state": str(state_path),
+            "patched_gpu_initialization_probe": patched_probe_result,
+            "stock_gpu_verification": stock_probe_result,
             "registers": register_results,
             "next_required_validation": (
                 "run GEMM throughput and thermal tests; readback alone is not proof"
@@ -1039,4 +1266,5 @@ def experimental_apply(
 
 
 ACKNOWLEDGEMENT = _ACKNOWLEDGEMENT
+REPORTED_PATH_ACKNOWLEDGEMENT = _REPORTED_PATH_ACKNOWLEDGEMENT
 COLD_CYCLE_ACKNOWLEDGEMENT = _COLD_CYCLE_ACKNOWLEDGEMENT

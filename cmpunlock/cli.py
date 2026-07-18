@@ -23,7 +23,6 @@ from .profile import (
     match_profile_for_firmware,
 )
 from .system import (
-    ACKNOWLEDGEMENT,
     build_apply_plan,
     clear_state,
     experimental_apply,
@@ -115,11 +114,19 @@ def command_payload_build(args: argparse.Namespace) -> None:
     result = report.as_dict()
     result["output"] = str(Path(args.output).resolve())
     result["profile"] = profile.profile_id
-    result["evidence_warning"] = (
-        "paper proof-of-control only; this payload intentionally does not resume the driver"
-        if args.mode == "proof"
-        else "productive continuation is community-derived and has not been reproduced on hardware"
-    )
+    if args.mode == "proof":
+        result["evidence_warning"] = (
+            "paper proof-of-control only; this payload intentionally does not resume the driver"
+        )
+    elif profile.evidence == "community-reported-hardware":
+        result["evidence_warning"] = (
+            "single community-reported 20c2 compute result; not independently reproduced "
+            "and not evidence of a memory-capacity unlock"
+        )
+    else:
+        result["evidence_warning"] = (
+            "productive continuation is community-derived and has not been reproduced on hardware"
+        )
     _json(result)
 
 

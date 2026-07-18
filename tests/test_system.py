@@ -19,10 +19,13 @@ from cmpunlock.errors import ApplyError, SystemCheckError
 from cmpunlock.system import Bar0, PciDevice
 
 
+_NVIDIA_SMI = str(Path("/usr/bin/nvidia-smi").resolve())
+
+
 def _device(
     profile,
     *,
-    device_id: str = "2082",
+    device_id: str | None = None,
     vendor_id: str = "10de",
     driver: str | None = None,
     resource0_size: int | None = None,
@@ -30,11 +33,12 @@ def _device(
     required_size = max(
         profile.plm_readback_address,
         *(write.address for write in profile.host_writes),
+        *(write.address for write in profile.hs_writes),
     ) + 4
     return PciDevice(
         bdf="0000:01:00.0",
         vendor_id=vendor_id,
-        device_id=device_id,
+        device_id=device_id or profile.accepted_device_ids[0],
         subsystem_vendor_id="10de",
         subsystem_device_id="0000",
         class_code="030200",
@@ -81,6 +85,7 @@ def test_validate_target_rejects_bar0_one_byte_too_small(profile_580_105) -> Non
     minimum = max(
         profile_580_105.plm_readback_address,
         *(write.address for write in profile_580_105.host_writes),
+        *(write.address for write in profile_580_105.hs_writes),
     ) + 4
 
     system.validate_target(
@@ -89,6 +94,31 @@ def test_validate_target_rejects_bar0_one_byte_too_small(profile_580_105) -> Non
     with pytest.raises(SystemCheckError, match="BAR0 is too small"):
         system.validate_target(
             _device(profile_580_105, resource0_size=minimum - 1), profile_580_105
+        )
+
+
+def test_reported_profile_requires_bar0_for_diagnostic_hs_addresses(
+    profile_580_173,
+) -> None:
+    minimum = max(write.address for write in profile_580_173.hs_writes) + 4
+
+    system.validate_target(
+        _device(profile_580_173, resource0_size=minimum), profile_580_173
+    )
+    with pytest.raises(SystemCheckError, match="BAR0 is too small"):
+        system.validate_target(
+            _device(profile_580_173, resource0_size=minimum - 1), profile_580_173
+        )
+
+
+def test_reported_profile_is_restricted_to_reported_20c2_device(
+    profile_580_173,
+) -> None:
+    system.validate_target(_device(profile_580_173), profile_580_173)
+
+    with pytest.raises(SystemCheckError, match="expected one of: 20c2"):
+        system.validate_target(
+            _device(profile_580_173, device_id="2082"), profile_580_173
         )
 
 
@@ -126,6 +156,85 @@ def test_validate_live_profile_enforces_hard_coded_write_contract(
 
     with pytest.raises(SystemCheckError, match="host BAR0 writes"):
         system.validate_live_profile(custom)
+
+
+def test_validate_live_profile_accepts_exact_reported_contract(
+    profile_580_173,
+) -> None:
+    system.validate_live_profile(profile_580_173)
+
+
+def test_validate_live_profile_rejects_reported_contract_on_other_version(
+    profile_580_173, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    custom = replace(profile_580_173, driver_version="580.999.99")
+    monkeypatch.setattr(system, "bundled_profile_paths", lambda: [Path("synthetic.json")])
+    monkeypatch.setattr(system, "load_profile", lambda _path: custom)
+
+    with pytest.raises(SystemCheckError, match="pinned to 580.173.02"):
+        system.validate_live_profile(custom)
+
+
+def test_reported_apply_plan_discloses_sequence_and_stronger_acknowledgement(
+    profile_580_173, local_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    firmware = local_tmp_path / "gsp_tu10x.bin"
+    firmware.write_bytes(b"stock")
+    monkeypatch.setattr(
+        system,
+        "build_compute_payload",
+        lambda _profile: (b"payload", SimpleNamespace()),
+    )
+    monkeypatch.setattr(
+        system,
+        "patch_firmware",
+        lambda *_args: (
+            b"patched",
+            SimpleNamespace(as_dict=lambda: {"patched_sha256": "f" * 64}),
+        ),
+    )
+
+    plan = system.build_apply_plan("0000:01:00.0", firmware, profile_580_173)
+
+    assert plan["required_acknowledgement"] == system.REPORTED_PATH_ACKNOWLEDGEMENT
+    assert plan["memory_capacity_verified"] is False
+    assert any("FLR #1" in stage and "FLR #2" in stage for stage in plan["planned_stages"])
+    assert any("write only the two compute overrides" in stage for stage in plan["planned_stages"])
+
+
+def test_system_inspect_requires_target_scoped_stock_nvidia_smi_probe(
+    profile_580_173, local_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    firmware = local_tmp_path / "gsp_tu10x.bin"
+    firmware.write_bytes(b"stock")
+    device = replace(_device(profile_580_173), driver="nvidia")
+    commands: list[tuple[str, ...]] = []
+    monkeypatch.setattr(system, "require_linux", lambda: None)
+    monkeypatch.setattr(system, "inspect_pci_device", lambda *_args, **_kwargs: device)
+    monkeypatch.setattr(system, "validate_stock_firmware", lambda *_args: None)
+    monkeypatch.setattr(system, "validate_module", lambda _profile: {"version": "580.173.02"})
+    monkeypatch.setattr(system, "enumerate_nvidia_devices", lambda *_args: (device.bdf,))
+    monkeypatch.setattr(system, "loaded_nvidia_modules", lambda: ("nvidia",))
+    monkeypatch.setattr(system.shutil, "which", lambda _command: _NVIDIA_SMI)
+
+    def run(command: list[str], **_kwargs: object):
+        commands.append(tuple(command))
+        return SimpleNamespace(stdout="00000000:01:00.0\n", stderr="", returncode=0)
+
+    monkeypatch.setattr(system, "_run", run)
+
+    result = system.inspect_system(
+        device.bdf,
+        firmware,
+        profile_580_173,
+        sysfs_root=local_tmp_path,
+    )
+
+    expected = tuple(system._nvidia_smi_command(device.bdf, _NVIDIA_SMI))
+    assert commands == [expected]
+    assert result["nvidia_smi"]["path"] == _NVIDIA_SMI
+    assert result["nvidia_smi"]["stock_probe"]["returncode"] == 0
+    assert result["nvidia_smi"]["stock_probe"]["stdout"] == "00000000:01:00.0"
 
 
 def _synthetic_booter(profile):
@@ -513,9 +622,15 @@ def test_clear_state_requires_cold_cycle_ack_and_verified_stock(
 
 
 class _FakeBar0:
-    def __init__(self, registers: dict[int, int], writes: list[tuple[int, int]]) -> None:
+    def __init__(
+        self,
+        registers: dict[int, int],
+        writes: list[tuple[int, int]],
+        events: list[tuple[object, ...]] | None = None,
+    ) -> None:
         self.registers = registers
         self.writes = writes
+        self.events = events
 
     def __enter__(self) -> "_FakeBar0":
         return self
@@ -524,9 +639,13 @@ class _FakeBar0:
         return None
 
     def read32(self, address: int) -> int:
+        if self.events is not None:
+            self.events.append(("bar0-read", address))
         return self.registers[address]
 
     def write32(self, address: int, value: int) -> None:
+        if self.events is not None:
+            self.events.append(("bar0-write", address, value))
         self.writes.append((address, value))
         self.registers[address] = value
 
@@ -552,9 +671,13 @@ def _mock_apply_environment(
     for index, write in enumerate(profile.host_writes, start=1):
         old_values[write.address] = index * 0x11111111
         registers[write.address] = old_values[write.address]
+    for index, write in enumerate(system._diagnostic_hs_writes(profile), start=1):
+        registers[write.address] = 0x20000000 + index
     register_writes: list[tuple[int, int]] = []
     commands: list[tuple[str, ...]] = []
     firmware_writes: list[bytes] = []
+    reset_calls: list[tuple[str, Path]] = []
+    events: list[tuple[object, ...]] = []
 
     @contextlib.contextmanager
     def unlocked() -> Iterator[None]:
@@ -573,12 +696,19 @@ def _mock_apply_environment(
         path.write_bytes(data)
         if path == firmware.resolve():
             firmware_writes.append(data)
+            events.append(("firmware", "patched" if data == patched else "stock"))
 
     def run(command: list[str], **_kwargs: object):
         commands.append(tuple(command))
+        events.append(("command", tuple(command)))
         if command == ["modprobe", "nvidia"]:
             registers[profile.plm_readback_address] = profile.plm_open_value
         return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    def reset_device(bdf: str, root: Path) -> None:
+        reset_calls.append((bdf, root))
+        events.append(("flr", len(reset_calls)))
+        reset.write_text("1\n", encoding="ascii")
 
     monkeypatch.setattr(system, "require_linux", lambda: None)
     monkeypatch.setattr(system.os, "geteuid", lambda: 0, raising=False)
@@ -589,7 +719,7 @@ def _mock_apply_environment(
     monkeypatch.setattr(
         system,
         "_reset_device",
-        lambda *_args: reset.write_text("1\n", encoding="ascii"),
+        reset_device,
     )
     monkeypatch.setattr(system, "validate_module", lambda _profile: {})
     monkeypatch.setattr(system, "validate_stock_firmware", lambda *_args: None)
@@ -608,14 +738,16 @@ def _mock_apply_environment(
     monkeypatch.setattr(
         system,
         "Bar0",
-        lambda *_args, **_kwargs: _FakeBar0(registers, register_writes),
+        lambda *_args, **_kwargs: _FakeBar0(registers, register_writes, events),
     )
     monkeypatch.setattr(system, "_run", run)
+    monkeypatch.setattr(system.shutil, "which", lambda command: f"/usr/bin/{command}")
     monkeypatch.setattr(system.signal, "getsignal", lambda _signal: "old-handler")
     monkeypatch.setattr(system.signal, "signal", lambda *_args: None)
     return SimpleNamespace(
         commands=commands,
         device=device,
+        events=events,
         firmware=firmware,
         firmware_writes=firmware_writes,
         old_values=old_values,
@@ -623,6 +755,7 @@ def _mock_apply_environment(
         register_writes=register_writes,
         registers=registers,
         reset=reset,
+        reset_calls=reset_calls,
         stock=stock,
     )
 
@@ -769,15 +902,461 @@ def test_experimental_apply_success_restores_firmware_and_completes_state(
     assert harness.reset.read_text(encoding="ascii") == "1\n"
     assert harness.commands == [
         ("modprobe", "nvidia"),
+        tuple(system._nvidia_smi_command(harness.device.bdf, _NVIDIA_SMI)),
         ("modprobe", "-r", "nvidia"),
         ("modprobe", "nvidia"),
+        tuple(system._nvidia_smi_command(harness.device.bdf, _NVIDIA_SMI)),
     ]
+    assert harness.reset_calls == [(harness.device.bdf, local_tmp_path)]
     assert state["stage"] == "complete"
     assert state["firmware_restored"] is True
     assert state["override_state_may_be_active"] is True
     assert state["patched_firmware_boot_attempted"] is True
+    assert state["patched_gpu_initialization_probe"]["returncode"] == 0
+    assert state["stock_gpu_verification"]["returncode"] == 0
+    assert state["stock_module_may_be_loaded"] is True
     assert state["error"] is None
     assert not system._journal_path(harness.firmware.resolve()).exists()
+
+
+def test_reported_apply_uses_two_flrs_and_never_host_writes_memory_registers(
+    profile_580_173, local_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = _mock_apply_environment(
+        profile_580_173,
+        local_tmp_path,
+        monkeypatch,
+        inspect_drivers=(None, None, "nvidia"),
+    )
+
+    result = system.experimental_apply(
+        harness.device.bdf,
+        harness.firmware,
+        profile_580_173,
+        acknowledgement=system.REPORTED_PATH_ACKNOWLEDGEMENT,
+        settle_seconds=0,
+        sysfs_root=local_tmp_path,
+    )
+
+    state = json.loads(
+        system._state_path(harness.firmware.resolve()).read_text(encoding="utf-8")
+    )
+    probe = tuple(system._nvidia_smi_command(harness.device.bdf, _NVIDIA_SMI))
+    assert harness.commands == [
+        ("modprobe", "nvidia"),
+        probe,
+        ("modprobe", "-r", "nvidia"),
+        ("modprobe", "nvidia"),
+        probe,
+    ]
+    assert harness.reset_calls == [
+        (harness.device.bdf, local_tmp_path),
+        (harness.device.bdf, local_tmp_path),
+    ]
+    assert harness.register_writes == [
+        (write.address, write.value) for write in profile_580_173.host_writes
+    ]
+    diagnostic_addresses = {
+        write.address for write in system._diagnostic_hs_writes(profile_580_173)
+    }
+    assert not diagnostic_addresses & {
+        address for address, _value in harness.register_writes
+    }
+    assert result["execution_strategy"] == "reported-two-phase"
+    assert result["memory_capacity_verified"] is False
+    assert result["patched_gpu_initialization_probe"]["returncode"] == 0
+    assert result["stock_gpu_verification"]["returncode"] == 0
+    assert state["execution_strategy"] == "reported-two-phase"
+    assert state["memory_capacity_verified"] is False
+    assert state["stage"] == "complete"
+    assert "FBPA_CFG1_UNVERIFIED" in result["baseline_registers"]
+    assert "LMR_UNVERIFIED" in result["baseline_registers"]
+
+    loads = [
+        index
+        for index, event in enumerate(harness.events)
+        if event == ("command", ("modprobe", "nvidia"))
+    ]
+    probes = [
+        index
+        for index, event in enumerate(harness.events)
+        if event == ("command", probe)
+    ]
+    flrs = [
+        index
+        for index, event in enumerate(harness.events)
+        if event[0] == "flr"
+    ]
+    writes = [
+        index
+        for index, event in enumerate(harness.events)
+        if event[0] == "bar0-write"
+    ]
+    patched_install = harness.events.index(("firmware", "patched"))
+    clean_unload = harness.events.index(
+        ("command", ("modprobe", "-r", "nvidia"))
+    )
+    stock_restore = harness.events.index(("firmware", "stock"))
+    post_flr_plm_gate = next(
+        index
+        for index, event in enumerate(harness.events)
+        if index > flrs[1]
+        and event == ("bar0-read", profile_580_173.plm_readback_address)
+    )
+    assert len(loads) == len(probes) == len(flrs) == len(writes) == 2
+    assert (
+        patched_install
+        < loads[0]
+        < probes[0]
+        < flrs[0]
+        < clean_unload
+        < stock_restore
+        < flrs[1]
+        < post_flr_plm_gate
+        < writes[0]
+        < writes[1]
+        < loads[1]
+        < probes[1]
+    )
+
+
+def test_reported_apply_requires_memory_side_effect_acknowledgement(
+    profile_580_173, local_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = _mock_apply_environment(
+        profile_580_173,
+        local_tmp_path,
+        monkeypatch,
+        inspect_drivers=(None,),
+    )
+
+    with pytest.raises(ApplyError, match=system.REPORTED_PATH_ACKNOWLEDGEMENT):
+        system.experimental_apply(
+            harness.device.bdf,
+            harness.firmware,
+            profile_580_173,
+            acknowledgement=system.ACKNOWLEDGEMENT,
+            settle_seconds=0,
+            sysfs_root=local_tmp_path,
+        )
+
+    assert harness.commands == []
+    assert harness.firmware_writes == []
+    assert harness.reset_calls == []
+
+
+def test_reported_apply_requires_nvidia_smi_before_firmware_mutation(
+    profile_580_173, local_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = _mock_apply_environment(
+        profile_580_173,
+        local_tmp_path,
+        monkeypatch,
+        inspect_drivers=(None,),
+    )
+    monkeypatch.setattr(system.shutil, "which", lambda _command: None)
+
+    with pytest.raises(SystemCheckError, match="nvidia-smi is required"):
+        system.experimental_apply(
+            harness.device.bdf,
+            harness.firmware,
+            profile_580_173,
+            acknowledgement=system.REPORTED_PATH_ACKNOWLEDGEMENT,
+            settle_seconds=0,
+            sysfs_root=local_tmp_path,
+        )
+
+    assert harness.commands == []
+    assert harness.firmware_writes == []
+    assert harness.register_writes == []
+    assert harness.reset_calls == []
+
+
+def test_reported_apply_records_nonzero_patched_probe_and_continues_to_plm_gate(
+    profile_580_173, local_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = _mock_apply_environment(
+        profile_580_173,
+        local_tmp_path,
+        monkeypatch,
+        inspect_drivers=(None, None, "nvidia"),
+    )
+    probe_calls = 0
+
+    def run(command: list[str], **_kwargs: object):
+        nonlocal probe_calls
+        harness.commands.append(tuple(command))
+        if command == ["modprobe", "nvidia"]:
+            harness.registers[
+                profile_580_173.plm_readback_address
+            ] = profile_580_173.plm_open_value
+        if command and command[0] == _NVIDIA_SMI:
+            probe_calls += 1
+            return SimpleNamespace(
+                stdout="",
+                stderr="expected patched initialization failure" if probe_calls == 1 else "",
+                returncode=9 if probe_calls == 1 else 0,
+            )
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(system, "_run", run)
+
+    result = system.experimental_apply(
+        harness.device.bdf,
+        harness.firmware,
+        profile_580_173,
+        acknowledgement=system.REPORTED_PATH_ACKNOWLEDGEMENT,
+        settle_seconds=0,
+        sysfs_root=local_tmp_path,
+    )
+
+    assert probe_calls == 2
+    assert result["patched_gpu_initialization_probe"]["returncode"] == 9
+    assert result["patched_gpu_initialization_probe"]["timed_out"] is False
+    assert result["stock_gpu_verification"]["returncode"] == 0
+
+
+def test_reported_apply_records_patched_probe_timeout_and_continues_to_plm_gate(
+    profile_580_173, local_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = _mock_apply_environment(
+        profile_580_173,
+        local_tmp_path,
+        monkeypatch,
+        inspect_drivers=(None, None, "nvidia"),
+    )
+    probe_calls = 0
+
+    def run(command: list[str], **_kwargs: object):
+        nonlocal probe_calls
+        harness.commands.append(tuple(command))
+        if command == ["modprobe", "nvidia"]:
+            harness.registers[
+                profile_580_173.plm_readback_address
+            ] = profile_580_173.plm_open_value
+        if command and command[0] == _NVIDIA_SMI:
+            probe_calls += 1
+            if probe_calls == 1:
+                raise ApplyError("simulated patched probe timeout")
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(system, "_run", run)
+
+    result = system.experimental_apply(
+        harness.device.bdf,
+        harness.firmware,
+        profile_580_173,
+        acknowledgement=system.REPORTED_PATH_ACKNOWLEDGEMENT,
+        settle_seconds=0,
+        sysfs_root=local_tmp_path,
+    )
+
+    assert probe_calls == 2
+    assert result["patched_gpu_initialization_probe"]["returncode"] is None
+    assert result["patched_gpu_initialization_probe"]["timed_out"] is True
+    assert "simulated patched probe timeout" in result[
+        "patched_gpu_initialization_probe"
+    ]["detail"]
+
+
+def test_reported_apply_closed_plm_after_flrs_prevents_all_host_writes(
+    profile_580_173, local_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = _mock_apply_environment(
+        profile_580_173,
+        local_tmp_path,
+        monkeypatch,
+        inspect_drivers=(None, None),
+    )
+
+    def reset_device(bdf: str, root: Path) -> None:
+        harness.reset_calls.append((bdf, root))
+        harness.reset.write_text("1\n", encoding="ascii")
+        if len(harness.reset_calls) == 2:
+            harness.registers[profile_580_173.plm_readback_address] = 0
+
+    monkeypatch.setattr(system, "_reset_device", reset_device)
+
+    with pytest.raises(ApplyError, match="FEAT_OVR_PLM read 0x00000000"):
+        system.experimental_apply(
+            harness.device.bdf,
+            harness.firmware,
+            profile_580_173,
+            acknowledgement=system.REPORTED_PATH_ACKNOWLEDGEMENT,
+            settle_seconds=0,
+            sysfs_root=local_tmp_path,
+        )
+
+    assert len(harness.reset_calls) == 2
+    assert harness.register_writes == []
+    assert harness.firmware_writes == [harness.patched, harness.stock]
+    assert harness.firmware.read_bytes() == harness.stock
+    state = json.loads(
+        system._state_path(harness.firmware.resolve()).read_text(encoding="utf-8")
+    )
+    assert state["host_compute_overrides_may_be_active"] is False
+    assert state["reported_hs_side_effects_may_be_active"] is True
+    assert state["override_state_may_be_active"] is True
+
+
+def test_reported_apply_flr1_failure_restores_stock_without_host_writes(
+    profile_580_173, local_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = _mock_apply_environment(
+        profile_580_173,
+        local_tmp_path,
+        monkeypatch,
+        inspect_drivers=(None,),
+    )
+
+    def fail_flr1(bdf: str, root: Path) -> None:
+        harness.reset_calls.append((bdf, root))
+        raise ApplyError("simulated FLR1 failure")
+
+    monkeypatch.setattr(system, "_reset_device", fail_flr1)
+
+    with pytest.raises(ApplyError, match="simulated FLR1 failure"):
+        system.experimental_apply(
+            harness.device.bdf,
+            harness.firmware,
+            profile_580_173,
+            acknowledgement=system.REPORTED_PATH_ACKNOWLEDGEMENT,
+            settle_seconds=0,
+            sysfs_root=local_tmp_path,
+        )
+
+    assert len(harness.reset_calls) == 1
+    assert harness.register_writes == []
+    assert harness.firmware_writes == [harness.patched, harness.stock]
+    assert harness.firmware.read_bytes() == harness.stock
+    assert ("modprobe", "-r", "nvidia") in harness.commands
+    assert all(command[0] not in {"rmmod", "kill", "pkill"} for command in harness.commands)
+
+
+def test_reported_apply_unload_failure_retries_cleanly_and_restores_stock(
+    profile_580_173, local_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = _mock_apply_environment(
+        profile_580_173,
+        local_tmp_path,
+        monkeypatch,
+        inspect_drivers=(None,),
+    )
+    unload_attempts = 0
+
+    def run(command: list[str], **_kwargs: object):
+        nonlocal unload_attempts
+        harness.commands.append(tuple(command))
+        if command == ["modprobe", "nvidia"]:
+            harness.registers[
+                profile_580_173.plm_readback_address
+            ] = profile_580_173.plm_open_value
+        if command == ["modprobe", "-r", "nvidia"]:
+            unload_attempts += 1
+            if unload_attempts == 1:
+                raise ApplyError("simulated reported unload failure")
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(system, "_run", run)
+
+    with pytest.raises(ApplyError, match="simulated reported unload failure"):
+        system.experimental_apply(
+            harness.device.bdf,
+            harness.firmware,
+            profile_580_173,
+            acknowledgement=system.REPORTED_PATH_ACKNOWLEDGEMENT,
+            settle_seconds=0,
+            sysfs_root=local_tmp_path,
+        )
+
+    assert unload_attempts == 2
+    assert len(harness.reset_calls) == 1
+    assert harness.register_writes == []
+    assert harness.firmware_writes == [harness.patched, harness.stock]
+    assert harness.firmware.read_bytes() == harness.stock
+    assert all(command[0] not in {"rmmod", "kill", "pkill"} for command in harness.commands)
+
+
+def test_reported_apply_restores_stock_before_flr2_and_handles_flr2_failure(
+    profile_580_173, local_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = _mock_apply_environment(
+        profile_580_173,
+        local_tmp_path,
+        monkeypatch,
+        inspect_drivers=(None,),
+    )
+
+    def fail_flr2(bdf: str, root: Path) -> None:
+        harness.reset_calls.append((bdf, root))
+        if len(harness.reset_calls) == 2:
+            assert harness.firmware.read_bytes() == harness.stock
+            raise ApplyError("simulated FLR2 failure")
+
+    monkeypatch.setattr(system, "_reset_device", fail_flr2)
+
+    with pytest.raises(ApplyError, match="simulated FLR2 failure"):
+        system.experimental_apply(
+            harness.device.bdf,
+            harness.firmware,
+            profile_580_173,
+            acknowledgement=system.REPORTED_PATH_ACKNOWLEDGEMENT,
+            settle_seconds=0,
+            sysfs_root=local_tmp_path,
+        )
+
+    assert len(harness.reset_calls) == 2
+    assert harness.register_writes == []
+    assert harness.firmware_writes == [harness.patched, harness.stock]
+    assert harness.firmware.read_bytes() == harness.stock
+
+
+def test_reported_apply_requires_successful_final_stock_probe(
+    profile_580_173, local_tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = _mock_apply_environment(
+        profile_580_173,
+        local_tmp_path,
+        monkeypatch,
+        inspect_drivers=(None, None),
+    )
+    probe_calls = 0
+
+    def run(command: list[str], **_kwargs: object):
+        nonlocal probe_calls
+        harness.commands.append(tuple(command))
+        if command == ["modprobe", "nvidia"]:
+            harness.registers[
+                profile_580_173.plm_readback_address
+            ] = profile_580_173.plm_open_value
+        if command and command[0] == _NVIDIA_SMI:
+            probe_calls += 1
+            if probe_calls == 2:
+                raise ApplyError("simulated stock nvidia-smi failure")
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(system, "_run", run)
+
+    with pytest.raises(ApplyError, match="cold power cycle required") as raised:
+        system.experimental_apply(
+            harness.device.bdf,
+            harness.firmware,
+            profile_580_173,
+            acknowledgement=system.REPORTED_PATH_ACKNOWLEDGEMENT,
+            settle_seconds=0,
+            sysfs_root=local_tmp_path,
+        )
+
+    state = json.loads(
+        system._state_path(harness.firmware.resolve()).read_text(encoding="utf-8")
+    )
+    assert "simulated stock nvidia-smi failure" in str(raised.value)
+    assert state["stage"] == "stock-module-load-returned"
+    assert "simulated stock nvidia-smi failure" in state["error"]
+    assert state["stock_gpu_verification"] is None
+    assert state["stock_module_may_be_loaded"] is True
+    assert harness.firmware.read_bytes() == harness.stock
+    assert all(command[0] not in {"rmmod", "kill", "pkill"} for command in harness.commands)
 
 
 @pytest.mark.parametrize(
@@ -1045,7 +1624,7 @@ def test_experimental_apply_final_bind_failure_records_partial_state(
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert "did not bind to the stock nvidia driver" in str(raised.value)
     assert harness.firmware.read_bytes() == harness.stock
-    assert state["stage"] == "flr-complete"
+    assert state["stage"] == "stock-module-load-returned"
     assert state["cold_power_cycle_required"] is True
     assert state["override_state_may_be_active"] is True
     assert state["firmware_restored"] is True
@@ -1136,6 +1715,7 @@ def test_experimental_apply_restores_stock_when_driver_load_fails(
     )
     monkeypatch.setattr(system, "loaded_nvidia_modules", lambda: ())
     monkeypatch.setattr(system, "validate_module", lambda _profile: {})
+    monkeypatch.setattr(system.shutil, "which", lambda command: f"/usr/bin/{command}")
     monkeypatch.setattr(system, "validate_stock_firmware", lambda *_args: None)
     monkeypatch.setattr(
         system,

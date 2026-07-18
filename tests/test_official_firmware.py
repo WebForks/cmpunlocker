@@ -41,6 +41,24 @@ FIXTURES = [
         30_497_880,
         id="580.126.09",
     ),
+    pytest.param(
+        "580.173.02",
+        [
+            Path(
+                "C:/tmp/nvidia-driver-58017302/extracted/firmware/gsp_tu10x.bin"
+            ),
+            Path(
+                "/tmp/nvidia-driver-58017302/extracted/firmware/gsp_tu10x.bin"
+            ),
+        ],
+        "6f3ccbd570c7ac2a7ea910d9d87fc3d23db9ae3dfe82020ea07b17a30954495e",
+        {
+            "proof": "7ed44320995f068f15c082d116f8c15319ea6b11d497914fc21c75b92b81c54e",
+            "compute": "6b57e314f980e0d2f343ee9604e59b440a668f6797e9358acf2b8a7333468c85",
+        },
+        30_530_648,
+        id="580.173.02",
+    ),
 ]
 
 

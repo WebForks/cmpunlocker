@@ -15,7 +15,14 @@ def test_cli_lists_profiles_as_json(capsys: pytest.CaptureFixture[str]) -> None:
     main(["profile", "list"])
 
     document = json.loads(capsys.readouterr().out)
-    assert {item["driver_version"] for item in document} == {"580.105.08", "580.126.09"}
+    assert {item["driver_version"] for item in document} == {
+        "580.105.08",
+        "580.126.09",
+        "580.173.02",
+    }
+    reported = next(item for item in document if item["driver_version"] == "580.173.02")
+    assert reported["execution_strategy"] == "reported-two-phase"
+    assert reported["accepted_pci_device_ids"] == ["20c2"]
 
 
 def test_cli_rejects_unknown_profile(capsys: pytest.CaptureFixture[str]) -> None:

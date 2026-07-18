@@ -13,9 +13,40 @@ from cmpunlock.profile import FirmwareProfile, bundled_profile_paths, load_profi
 def test_bundled_profiles_load_and_exclude_a100() -> None:
     profiles = [load_profile(path) for path in bundled_profile_paths()]
 
-    assert {profile.driver_version for profile in profiles} == {"580.105.08", "580.126.09"}
-    assert all(profile.accepted_device_ids == ("2082", "20c2") for profile in profiles)
+    assert {profile.driver_version for profile in profiles} == {
+        "580.105.08",
+        "580.126.09",
+        "580.173.02",
+    }
+    by_version = {profile.driver_version: profile for profile in profiles}
+    assert by_version["580.105.08"].accepted_device_ids == ("2082", "20c2")
+    assert by_version["580.126.09"].accepted_device_ids == ("2082", "20c2")
+    assert by_version["580.105.08"].execution_strategy == "legacy-compute-only"
+    assert by_version["580.126.09"].execution_strategy == "legacy-compute-only"
+    assert by_version["580.173.02"].accepted_device_ids == ("20c2",)
+    assert by_version["580.173.02"].evidence == "community-reported-hardware"
+    assert by_version["580.173.02"].execution_strategy == "reported-two-phase"
     assert all("20b0" not in profile.accepted_device_ids for profile in profiles)
+
+
+def test_reported_profile_reproduces_exact_community_hs_sequence(
+    profile_580_173,
+) -> None:
+    assert [(write.address, write.value) for write in profile_580_173.hs_writes] == [
+        (0x009A0204, 0x02779000),
+        (0x00100CE0, 0x0000020B),
+        (0x00823804, 0xFFFFFFFF),
+    ]
+
+
+def test_profile_rejects_unknown_execution_strategy(
+    profile_580_173_raw: dict[str, object],
+) -> None:
+    raw = copy.deepcopy(profile_580_173_raw)
+    raw["execution"]["strategy"] = "invented"  # type: ignore[index]
+
+    with pytest.raises(ProfileError, match="unknown execution strategy"):
+        FirmwareProfile.from_dict(raw)
 
 
 @pytest.mark.parametrize("device_id", ["20b0", "20B0"])
