@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "profile_id": "ga100-580.105.08-community-experimental",
+  "evidence": "community-unverified",
+  "driver_version": "580.105.08",
+  "firmware": {
+    "size": 30327896,
+    "sha256": "84e0f47adc5b7f40a5789f1e3d528ca1269bd6184029dec0af6c76f9f282d0d7",
+    "signature_section": ".fwsignature_ga100",
+    "signature_offset": "0x1ce8f0f",
+    "signature_size": "0x1000",
+    "signature_sha256": "1815c63178d5635025e03555fb63a6cf4dc2d1b809767309575e49781ff92b8c"
+  },
+  "booter": {
+    "size": 60160,
+    "compressed_size": 34139,
+    "compressed_prefix_hex": "94bc43b0303cd305786ddbb66d5bcfb56ddbb66ddbb66ddbb66d63be7faa66f3",
+    "sha256": "edacea964e7199268b031ac0baac60358eb6845b38456c0b3e7dc8e2c35daf86"
+  },
+  "device": {
+    "accepted_pci_device_ids": ["2082", "20c2"]
+  },
+  "exploit": {
+    "dma_target": "0x0800",
+    "payload_size": "0xf800",
+    "guard_address": "0x6340",
+    "proof_fill": "0x04a7",
+    "canary_replacement": "0xfaceb13d",
+    "frame_start": "0xff48",
+    "frame_stride": "0x18",
+    "frame_field_offsets": ["0x00", "0x04", "0x08", "0x0c", "0x10", "0x14"],
+    "bar0_write_gadget": "0x10b9",
+    "tail_return": "0x810d",
+    "hs_writes": [
+      {"name": "FEAT_OVR_PLM", "address": "0x00823804", "value": "0xffffffff"},
+      {"name": "FEAT_OVR_PLM repeat 1", "address": "0x00823804", "value": "0xffffffff"},
+      {"name": "FEAT_OVR_PLM repeat 2", "address": "0x00823804", "value": "0xffffffff"}
+    ]
+  },
+  "compute": {
+    "plm_readback_address": "0x00823804",
+    "plm_open_value": "0xffffffff",
+    "host_writes": [
+      {"name": "FEAT_OVR_SM_SPD", "address": "0x0082381c", "value": "0x88888888"},
+      {"name": "FEAT_OVR_SM_SPD_1", "address": "0x00823820", "value": "0x00000008"}
+    ]
+  }
+}
+

@@ -1,0 +1,37 @@
+
+
+  Server Procedure
+  The code runs from the Linux host as root. It is not launched as a CUDA kernel.
+
+  cd GPU-unlocker
+  python3 -m venv .venv
+  .venv/bin/pip install -e .
+  source .venv/bin/activate
+
+  BDF=0000:41:00.0
+  GSP=/lib/firmware/nvidia/580.126.09/gsp_tu10x.bin
+
+  sudo .venv/bin/cmpunlock system inspect "$BDF" --firmware "$GSP"
+  cmpunlock system plan "$BDF" --firmware "$GSP"
+
+  system inspect must pass while the stock nvidia driver is loaded and bound. It rejects unknown firmware, a mismatched module/booter, the wrong PCI ID, or an unsupported BAR.
+
+  Next stop all GPU workloads and services, confirm no clients remain, and unload every NVIDIA module:
+
+  sudo fuser -v /dev/nvidia* /dev/nvidia-caps/*
+  sudo modprobe -r nvidia_uvm nvidia_drm nvidia_modeset nvidia_peermem nvidia
+    --acknowledge UNVERIFIED-CMP170HX-EXPERIMENT
+
+  On success, the stock firmware is restored before FLR and stock-driver reload. Then benchmark:
+
+  nvcc -O3 tools/sgemm_bench.cu -lcublas -o sgemm_bench
+  nvidia-smi --query-gpu=pci.bus_id,temperature.gpu,power.draw,clocks.sm \
+    --format=csv -l 1
+  ./sgemm_bench 8192 20
+
+  If a firmware recovery journal remains:
+
+  sudo .venv/bin/cmpunlock system recover --firmware "$GSP"
+
+  Any partial-state warning requires a complete cold power cycle. A warm reboot is not sufficient according to the paper.
+

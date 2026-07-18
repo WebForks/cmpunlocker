@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cmp170hx-research"
+version = "0.1.0"
+description = "Fail-closed research tooling for the CMP 170HX GA100 firmware study"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "GPL-2.0-only"
+authors = [{ name = "CMP 170HX research tooling contributors" }]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Topic :: System :: Hardware",
+]
+
+[project.scripts]
+cmpunlock = "cmpunlock.cli:main"
+
+[tool.setuptools]
+packages = ["cmpunlock"]
+
+[tool.setuptools.package-data]
+cmpunlock = ["profiles/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
