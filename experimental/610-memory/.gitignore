@@ -1,0 +1,5 @@
+.work/
+artifacts/
+tools/memory-pattern-test
+tools/memory-pattern-test.stage.*
+tools/memory-pattern-test.previous.*

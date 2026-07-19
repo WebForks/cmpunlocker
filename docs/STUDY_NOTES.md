@@ -181,3 +181,81 @@ safety invariant: host overrides are attempted only through an observed open PLM
 paper says override values survive FLR but warns that PLMs themselves may re-lock, so
 the post-FLR gate is essential. It does not convert the report into proof of the guide's
 memory or persistence claims.
+
+## Supplied NVIDIA 610.43.03 module path
+
+The later supplied bundle contains an official NVIDIA 610.43.03 runfile and an
+already-built source tree with local edits and thousands of compiler artifacts. The
+runfile is authentic: it is 461,538,429 bytes and its SHA-256 is
+`45e2d4c134a23c35e50f253a4aa63e7e5e8d17e3d185d4a07c8a58e9612ed392`, exactly the
+digest published by NVIDIA. The extracted `gsp_tu10x.bin` is 29,352,832 bytes with
+SHA-256 `73065619db9ec921d19fc4e519dd04d91a9199b525eaca9b257b89fb8c5ec52c`.
+Its decompressed GA100 production Booter is byte-identical to the three pinned 580
+images. The bundle does not contain a final set of loadable `.ko` modules, and neither
+the 461-MB runfile nor its stale object files belong in this repository.
+
+After line-ending and build-output normalization, the supplied source has eleven
+meaningful changes relative to NVIDIA's exact 610.43.03 release commit
+`452cec62d827034798072827d3866d1881662b77`. Its intended sequence is materially
+closer to the paper's mechanism than a capacity-number spoof alone:
+
+1. For PCI device `20c2`, enlarge the stock signature allocation and repeatedly run
+   the vendor-signed GA100 Booter with the community continuation.
+2. Open framebuffer, WPR, WPR-configuration, and feature-override PLMs and read them
+   back.
+3. Host-write the SM, framebuffer geometry, and LMR overrides, restore the authentic
+   signature, then continue the normal GSP boot.
+4. Report 64 GiB through GSP static metadata, keep PRAMIN in the native 8-GiB
+   aperture, avoid unsupported compressed/virtual scrub paths, and add the high
+   framebuffer range to PMA.
+5. Reapply the sequence at each patched-module initialization rather than relying on
+   a root watchdog.
+
+That is still not the paper's exact implementation. The paper uses a separate
+driverless host loader, omits its productive continuation and full register map, and
+reports 10-to-80-GB hardware rather than an identifiable `20c2` 8-to-64-GB run. Its
+stable 80-GB result also changes a refresh interval at a measured throughput cost;
+the supplied 610 path does not implement or derive that adjustment. It does not
+implement the paper's XVE/root-port sequence either, so it provides no basis for a
+PCIe Gen2 claim.
+
+The supplied installer and edits are not safe to use unchanged:
+
+- four PLM attempts can fail while initialization continues into host writes and
+  fabricated 64-GiB metadata;
+- a WPR2 error is weakened globally, including for unrelated GPUs;
+- `gpuValidateRegOps` returns success unconditionally for every device;
+- an optional root-controlled `dmem.bin` silently replaces the compiled payload;
+- partial SS/CFG1/LMR writes are not rolled back;
+- saved signature memory is leaked, region/PMA capacities are insufficiently
+  bounded, and the late-PMA result is logged but ignored;
+- the installer changes packages and userspace, stops services, attempts live
+  module removal, overwrites configuration, masks some initramfs failures, and has
+  no precise rollback to the prior module set;
+- its instruction to treat early Booter errors as generally harmless is not a
+  valid success criterion.
+
+The linked `amoghmunikote/cmpunlocker` repository was separately audited at commit
+`0a5f0624cc6f4cbbf3f2e8d357e891c4a64cc8a2`. It usefully separates patches and has
+an uninstall script, but its first patch is malformed against its pinned source and
+its profile rewrite currently matches no geometry constants. Its two screenshots
+show a software-visible 65,536-MiB value and a compute result; they do not provide
+raw kernel provenance, a full-range distinct-address test, error logs, thermals, or
+long-duration stability evidence.
+
+The quarantined `experimental/610-memory` integration therefore starts from the
+exact official source commit and retains only `20c2`-scoped changes. It restores
+stock behavior for every other device, keeps register-operation validation intact,
+requires exact PLM and host-write readbacks before publishing expanded metadata,
+validates region/PMA capacity, uses stable current-boot success markers, installs
+only an auditable module set, and provides a reversible removal path. It deliberately
+does not import the supplied runfile, objects, root one-shot installer, PCIe claim, or
+screenshots.
+
+Finally, `nvidia-smi` displaying 65,536 MiB is treated as necessary but not proof.
+The validator allocates 8, 16, 32, 48, then 60 GiB on the exact PCI function and
+writes several bijective address-dependent patterns to every 64-bit word. It emits
+`LLM_READY` only if all reads match, the expected patched module is loaded, current-
+boot unlock/PMA markers are complete, and no Xid or unlock-failure marker appears.
+Even that result certifies only the tested patterns, temperature, and duration; it
+cannot guarantee lifetime reliability of binned HBM.

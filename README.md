@@ -1,25 +1,35 @@
 # CMP 170HX GA100 unlock research tool
 
-This repository implements and audits the host-side mechanism described in
+This repository implements and audits host-side mechanisms related to
 [`main.pdf`](main.pdf), *A Canary in the Crypto Mine: Defeating Stack Protection
-in a GPU Secure Coprocessor*. It is an offline-first, fail-closed research tool,
-not a certified or independently reproduced hardware unlock.
+in a GPU Secure Coprocessor*. The default 580 workflow remains an offline-first,
+fail-closed compute experiment. A separate, quarantined
+[`experimental/610-memory`](experimental/610-memory/) workflow now reconstructs
+the supplied NVIDIA 610.43.03 module approach for exactly one `10de:20c2` card.
+Neither path is a certified or independently reproduced hardware unlock.
 
-The evidence has four distinct levels:
+The evidence has five distinct levels:
 
 1. The paper's offline proof-of-control payload is reproduced exactly.
 2. One external report exercised the original three-frame continuation on a
    `20c2` card with driver `580.173.02`, after adding an `nvidia-smi`
    initialization trigger. It reported compute near 12.1 TFLOP/s FP32 and
    6.3 TFLOP/s FP64, but still showed only 8192 MiB.
-3. The productive gadgets and register meanings remain community-derived. The
-   external report does not publish a decrypted derivation or raw reproduction
-   bundle, and it explicitly says the memory unlock failed.
-4. This project has not independently reproduced any CMP 170HX hardware result.
+3. A separate 610.43.03 report and two screenshots show a software-visible
+   65,536-MiB value and a compute result. They do not include a raw module hash,
+   full-range distinct-address output, error log, thermal log, or long-duration
+   stability artifact. A displayed capacity is not proof of physical,
+   non-aliased, reliable memory.
+4. The productive gadgets and register meanings remain community-derived. No
+   public source supplies the paper's decrypted derivation, complete register
+   map, or raw reproduction bundle.
+5. This project has not independently reproduced any CMP 170HX hardware result.
 
-Do not interpret a successful firmware patch, PLM readback, or register readback
-as proof of a working or stable compute unlock. The final proof is a correct
-before/after compute benchmark on the target hardware with adequate cooling.
+Do not interpret a successful firmware patch, PLM readback, register readback,
+or `nvidia-smi` capacity as proof of a working unlock. Compute needs a correct
+benchmark. Expanded memory needs full-range address-dependent writes and reads,
+repeated stress, clean kernel logs, and adequate cooling. Even a complete pass
+only describes that card at the tested temperature and duration.
 
 ## Quick install
 
@@ -31,10 +41,12 @@ installer as your normal user, not with `sudo`:
 .venv/bin/cmpunlock profile list
 ```
 
-`install.sh` replaces the previous virtual-environment setup commands. It creates
+The root `install.sh` replaces the previous virtual-environment setup commands. It creates
 or reuses `.venv`, installs this checkout in editable mode, and runs an offline
 smoke test. It does not inspect a GPU, invoke `sudo`, require root, unload a
-module, patch firmware, enable systemd, or execute the experimental path.
+module, patch firmware, enable systemd, or execute the experimental 610 path.
+The 610 experiment has its own reviewed installer and explicit acknowledgements;
+see [64-GiB experimental workflow](#64-gib-experimental-workflow-for-local-llms).
 
 The first package build needs access to `setuptools>=77`, either from the network
 or a configured local wheel cache. If virtual-environment creation fails on
@@ -50,6 +62,144 @@ py -3 -m venv .venv
 ```
 
 BAR0, driver, recovery, and state commands are Linux-only.
+
+## 64-GiB experimental workflow for local LLMs
+
+The honest answer is conditional: this can make one `10de:20c2` CMP 170HX
+*attempt* to expose 64 GiB, but software cannot promise that the disabled HBM on
+your particular binned card is reliable. Do not load a model merely because
+`nvidia-smi` says `65536 MiB`. Wait for the repository validator to print the
+literal final line `LLM_READY`.
+
+Use a disposable native Linux x86-64 host, not WSL or a VM. The CMP must be the
+only NVIDIA PCI function and must not drive a display. You need out-of-band
+console access, a way to remove AC power, server-grade forced airflow over the
+passive heatsink, matching running-kernel headers, normal C/kernel build tools,
+`git`, `kmod`, `binutils`, util-linux `flock`, an initramfs tool, and CUDA
+`nvcc`. Secure Boot and kernel lockdown must be disabled.
+
+The transaction currently supports `update-initramfs` plus `lsinitramfs`, or
+`dracut` plus `lsinitrd`. It also requires the kernel module `updates` directory
+and `/var/lib/cmpunlocker-610-memory/archives` to share a filesystem so module
+directory renames are atomic; preflight refuses other layouts.
+
+First install the exact official NVIDIA **open** 610.43.03 driver, userspace, and
+firmware through the method appropriate for your distribution. This repository
+does not automate that system-wide vendor installation. The scripts require a
+working stock `nvidia-smi`, module version `610.43.03`, and the exact official
+`gsp_tu10x.bin` (29,352,832 bytes, SHA-256
+`73065619db9ec921d19fc4e519dd04d91a9199b525eaca9b257b89fb8c5ec52c`) before
+they will build or install anything.
+
+Because distribution/local kernel-module builds do not have one published
+universal `.ko` hash, the scripts additionally require the loaded core
+`srcversion` to match the resolved file and record the exact five predecessor
+paths/hashes for rollback. That proves consistency with the selected predecessor,
+not original NVIDIA authorship of those locally installed module bytes.
+
+From this checkout, build as your normal user and install only the verified
+artifact as root:
+
+```bash
+cd experimental/610-memory
+
+./build.sh --dry-run
+./build.sh \
+  --acknowledge I-ACCEPT-UNVERIFIED-610-MEMORY-KERNEL-BUILD
+./build-validator.sh
+
+sudo ./install.sh --dry-run
+sudo ./install.sh \
+  --acknowledge I-ACCEPT-UNVERIFIED-610-MEMORY-KERNEL-INSTALL
+```
+
+The split privilege boundary is deliberate. `build.sh` fetches only NVIDIA
+commit `452cec62d827034798072827d3866d1881662b77`, verifies the patch hash, and
+builds for the running kernel without root. The installer neither runs a package
+manager nor the NVIDIA runfile, stops no service, kills no process, unloads no
+module, and does not hot-apply the experiment. It installs five verified modules
+under `updates/cmpunlocker-610-memory`, records the exact five-module predecessor
+set, backs up the exact initramfs bytes, runs `depmod`, rebuilds the current
+initramfs, rejects any competing/duplicate current-kernel NVIDIA module inside
+that image, and leaves the currently loaded stock driver untouched. An
+initramfs that legitimately contains no NVIDIA modules is accepted.
+
+Install, removal, cold-cycle confirmation, and validation share a nonblocking
+exclusive lock at `/var/lib/cmpunlocker-610-memory/operation.lock`; none can race
+another, and the lock remains held for the entire stress run. The first root
+install preflight may create only the root-owned 0700 state root and its 0600
+lock file; the first operation on a legacy pre-lock state tree may create that
+lock file too. `--dry-run` does not install modules or change boot metadata.
+
+Shut the machine down, remove AC power until the board has fully lost power,
+then cold-start it. Do not substitute an ordinary warm reboot. After boot, stop
+all GPU jobs and validate:
+
+```bash
+cd experimental/610-memory
+
+sudo ./validate.sh --preflight-only \
+  --cold-cycle-acknowledge I-CONFIRM-FULL-AC-POWER-CYCLE-AFTER-610-MEMORY-INSTALL
+
+sudo ./validate.sh --passes 5 \
+  --cold-cycle-acknowledge I-CONFIRM-FULL-AC-POWER-CYCLE-AFTER-610-MEMORY-INSTALL \
+  --acknowledge I-ACCEPT-UNVERIFIED-610-MEMORY-STRESS-AND-CONFIRM-FORCED-AIRFLOW
+```
+
+The fixed validator checks all five resolved module files, loads the verified
+`nvidia_uvm` if CUDA has not already loaded it, and verifies the loaded core/UVM
+provenance, exact PCI identity, exact on-disk GSP hash, loaded GSP firmware
+version, current-boot driver markers, all
+PLM/host-write/metadata/PMA gates,
+reported capacity, idle state, and kernel errors. It then allocates 8, 16, 32,
+48, and 60 GiB while a separate poller enforces the temperature limit. For every
+stage and pass it writes and reads three
+bijective address-dependent patterns across every 64-bit word. Any mismatch,
+allocation/CUDA error, Xid, missing marker, excessive temperature, or changed
+module stops the run without `LLM_READY`. Logs are retained under
+`/var/log/cmp170-memory-validation` by default. Each run directory also retains
+the root-owned installation record, five-module checksum manifest, resolved
+path/hash/version/source-version table, NVIDIA-SMI/NVML and loaded/on-disk GSP
+facts, boot IDs, kernel logs, temperatures, and per-stage output needed to audit
+which exact stack produced the result.
+
+Only after `LLM_READY` should you start an LLM backend, as your normal user. Plan
+against the tested 60-GiB allocation, not the displayed 64-GiB total: CUDA
+contexts, workspaces, KV cache, and the inference engine need headroom. In
+practice, keep model weights comfortably below roughly 55-58 GiB and monitor
+temperature and `dmesg` during initial long sessions. A 70B-class 4-bit model is
+a plausible fit; a 70B 8-bit model generally is not. This path does not pool
+cards, add ECC, enable NVLink, or improve PCIe, so model load and CPU offload can
+remain bottlenecked by the card's link.
+
+If any gate fails, do not run a model. Preserve the reported log directory and
+remove the experiment:
+
+```bash
+sudo ./remove.sh --dry-run
+sudo ./remove.sh \
+  --acknowledge REMOVE-CMPUNLOCKER-610-MEMORY-WITHOUT-HOT-UNLOAD
+```
+
+Removal archives rather than deletes the experimental module set, restores the
+recorded predecessor, rebuilds module metadata/initramfs, and deliberately does
+not hot-unload the running driver. Fully remove AC power again, cold-start, then
+record that physical clearing boundary:
+
+```bash
+sudo ./remove.sh --confirm-cold-cycle \
+  --acknowledge I-CONFIRM-FULL-AC-POWER-CYCLE-AFTER-610-MEMORY-REMOVAL
+```
+
+Before changing the kernel, NVIDIA driver/userspace/firmware, or initramfs
+tooling, run removal and complete its cold-cycle confirmation while the exact
+recorded predecessor still exists. Only then update, boot the new kernel, and
+build/install a new kernel-specific artifact. If an update was already applied,
+boot the recorded old kernel and restore its exact predecessor stack/tooling so
+`remove.sh` can verify and remove the old experiment; do not delete its target or
+state by hand. The full operational contract, failure behavior, and file layout
+are documented in
+[`experimental/610-memory/README.md`](experimental/610-memory/README.md).
 
 ## What is verified
 
@@ -70,6 +220,17 @@ BAR0, driver, recovery, and state commands are Linux-only.
   ELF input, BAR0 bounds, exact live-profile allowlists, transaction locking,
   atomic restoration, recovery validation, pre-boot audit durability, and
   failure paths. Live transaction tests use mocks, not a physical GPU.
+- The supplied 610.43.03 runfile matches NVIDIA's published SHA-256. Its exact
+  Turing GSP firmware and embedded GA100 Booter were independently fingerprinted;
+  the Booter is byte-identical to the pinned 580 copies.
+- The experimental 610 build starts from exact official open-module commit
+  `452cec62d827034798072827d3866d1881662b77`; no supplied object, prebuilt module,
+  runfile, or firmware blob is imported into this repository.
+- Frozen patch SHA-256
+  `f377efcb000035449a4520c3f306d0983c4de9b3dbe8a71f2ee616a5c0571c6b`
+  applies cleanly and compiled all five `610.43.03` modules against Ubuntu
+  `6.8.0-134-generic` headers. The final `nvidia.ko` contains the reviewed PMA
+  function and required validation markers. It was not loaded on hardware.
 
 ## What is not verified
 
@@ -92,12 +253,18 @@ BAR0, driver, recovery, and state commands are Linux-only.
 - Stock open-driver binding for CMP IDs `2082` and `20c2`. They are absent from
   NVIDIA's published 580 compatible-GPU tables. A host whose installed module does
   not already bind the card cannot complete this workflow.
-- No memory-capacity, PCIe, ECC, or NVLink workflow or success claim is
-  implemented. The reported profile contains two disclosed memory-related HS
-  side-effect frames, but the host never writes a capacity/refresh configuration
-  and the result always says memory is unverified. The paper did not defeat PCIe
-  Gen3, ECC, or runtime HBM mode-register programming, and its 80 GB result needed
-  a refresh/performance tradeoff.
+- The default 580 workflow does not implement memory capacity, PCIe, ECC, or
+  NVLink. Its reported profile contains two disclosed memory-related HS side
+  effects, but the host never publishes expanded capacity and the result always
+  says memory is unverified.
+- The quarantined 610 workflow implements a community-derived 8-to-64-GiB
+  geometry/PMA experiment and staged address testing through a 60-GiB
+  allocation. It has not been executed
+  by this project on a CMP 170HX. It does not implement the paper's undocumented
+  refresh adjustment, PCIe sequence, ECC, NVLink, or HBM mode-register path.
+  The paper did not defeat PCIe Gen3, ECC, or runtime HBM mode-register
+  programming, and its stable 80-GB result traded about 32% throughput for more
+  frequent refresh.
 - PCI ID `20b0`. It identifies an A100 SXM4 40 GB, not a CMP 170HX, and is
   unconditionally rejected even if a custom profile lists it.
 
@@ -111,6 +278,7 @@ BAR0, driver, recovery, and state commands are Linux-only.
 | Uniform proof dword `0x4a7` | Yes, Section 5.5 | Yes, `--mode proof` | Exact offline reproduction |
 | Productive continuation | Described, bytes omitted | Community-derived; exact reported sequence pinned for 580.173.02/20c2 | One external compute report; no independent reproduction |
 | Full PLM/register map | Explicitly omitted | Partial community-derived compute-path values; FBPA/LMR meanings unverified | Unverified |
+| Memory capacity | 10 to 80 GB; full-range hash and stress described, raw artifacts omitted | Separate experimental 20c2 8-to-64-GiB module path plus staged testing through 60 GiB | Community screenshots only; no local hardware run |
 | Driverless loader/emulator | Used, not published | Not included | Missing reproduction artifact |
 | SM throughput result | Reported in Table 2 | Benchmark included, no local result | One external 580.173.02 result; not reproduced here |
 
@@ -217,7 +385,62 @@ justifies preserving the exact sequence in a narrowly pinned profile for compute
 research. It does not justify the guide's memory, daemon, or broad-compatibility
 claims.
 
-## Supported inputs and live prerequisites
+## Comparison with the supplied 610.43.03 tree and `amoghmunikote/cmpunlocker`
+
+The supplied `other-project/Post.txt`, 461-MB NVIDIA runfile, and expanded
+`open-gpu-kernel-modules-610.43.03` tree were audited without executing their
+root installer or importing their binaries. The runfile is authentic, but the
+source tree contains 4,148 generated build files, no final loadable module set,
+and eleven local source changes. Ten match the public direction of the linked
+[`amoghmunikote/cmpunlocker`](https://github.com/amoghmunikote/cmpunlocker/tree/0a5f0624cc6f4cbbf3f2e8d357e891c4a64cc8a2);
+the extra supplied change disables register-operation validation globally.
+
+The linked repository was pinned at commit
+[`0a5f062`](https://github.com/amoghmunikote/cmpunlocker/commit/0a5f0624cc6f4cbbf3f2e8d357e891c4a64cc8a2).
+As currently published, its first patch is malformed against its pinned source,
+and its profile rewrite matches no geometry constants. Its screenshots are useful
+leads, but capacity text and a benchmark window cannot establish non-aliasing or
+HBM stability.
+
+| Area | This repository's quarantined integration | Supplied/public 610 path |
+|---|---|---|
+| Input | Exact NVIDIA commit, patch SHA, GSP size/hash, driver point release | Supplied pre-expanded tree and artifacts; public script accepts a small 610 family |
+| Scope | Exactly one NVIDIA PCI function, exactly `10de:20c2` | Claims multi-GPU support; some global behavior is weakened |
+| PLM gate | All four exact readbacks are mandatory before host overrides | Failed attempts are logged and initialization can continue |
+| Host writes | Exact SS0/SS1/CFG1/LMR readback; partial failure attempts rollback and blocks metadata/PMA | Writes are printed but not a complete fail-closed transaction |
+| Driver integrity | Stock regops validation; no optional external payload; stock behavior for every other device | Global regops bypass in the supplied tree; optional root-path `dmem.bin` |
+| Capacity publication | Validated region count/limits and PMA capacity; stable success/failure markers | Metadata/PMA manipulation can continue after earlier failures |
+| Install | Non-root pinned build, isolated module directory, no package/user-space/service/process changes, initramfs backup, reversible removal | One root workflow installs packages/userspace, stops services, rewrites configuration, and masks some recovery failures |
+| Proof | Requires fixed 8/16/32/48/60-GiB address-pattern stages and clean current-boot logs | `nvidia-smi` plus suggested short `gpu_burn`; no raw supplied output |
+| PCIe | Explicitly not implemented or claimed | Post claims Gen2; public README says platform-dependent; code does not supply a complete paper-derived root-port path |
+
+What was retained, because the high-range path depends on it: repeated signed
+Booter PLM writes, exact `20c2` SS/CFG1/LMR values, authentic-signature rebuild,
+64-GiB GSP metadata, late PMA registration, the native-aperture PRAMIN clamp,
+the `20c2` scrub/CE workaround, and per-boot reapplication. All were rewritten
+against the exact official source and kept behind the one-device gate.
+
+What was removed or changed: the global regops bypass, global WPR2 recovery,
+optional `dmem.bin`, non-fatal PLM/PMA paths, unchecked region growth, signature
+leak, PCIe claim, package installation, service stopping, live module removal,
+configuration overwrite, prebuilt blobs, and the instruction to regard Booter
+errors as generically harmless. See
+[`docs/STUDY_NOTES.md`](docs/STUDY_NOTES.md#supplied-nvidia-6104303-module-path)
+for the source-level audit.
+
+### Why the 610 memory path was not implemented earlier
+
+The earlier inputs were `main.pdf` and the public 580-oriented prototype. The
+paper deliberately omits its productive continuation, complete register map,
+loader, and raw validation artifacts, while the prototype did not provide this
+610 GSP-metadata/PMA integration. The later supplied 610.43.03 source tree made
+that additional sequence inspectable. It still could not be copied directly:
+its global validation bypasses, non-fatal failure paths, unchecked PMA growth,
+live root installer, and missing final module/test evidence were unsafe. The
+quarantined workflow was added only after rewriting those parts against an exact
+official source commit and adding reversible installation and high-range tests.
+
+## Supported inputs and live prerequisites for the 580 workflow
 
 Bundled profiles currently support exact stock firmware from:
 
@@ -433,11 +656,13 @@ tool does not implement or report a memory-capacity unlock.
 python -m pytest -q
 python -m compileall -q cmpunlock tests
 bash -n install.sh
+bash experimental/610-memory/tests/static.sh
 ```
 
 Tests against authentic firmware run when the exact cached NVIDIA fixtures are
 available; otherwise those three cases skip. POSIX installer behavior is tested on
-POSIX hosts and skipped on Windows.
+POSIX hosts and skipped on Windows. The CUDA validator compiles when `nvcc` is
+available; hardware allocation tests are never part of the unit suite.
 
 ## Sources and license
 
@@ -445,6 +670,10 @@ POSIX hosts and skipped on Windows.
 - Detailed audit: [`docs/STUDY_NOTES.md`](docs/STUDY_NOTES.md)
 - NVIDIA open kernel modules:
   <https://github.com/NVIDIA/open-gpu-kernel-modules>
+- Exact NVIDIA open-module 610.43.03 release:
+  <https://github.com/NVIDIA/open-gpu-kernel-modules/releases/tag/610.43.03>
+- NVIDIA 610.43.03 published runfile checksum:
+  <https://download.nvidia.com/XFree86/Linux-x86_64/610.43.03/NVIDIA-Linux-x86_64-610.43.03.run.sha256sum>
 - NVIDIA GSP documentation:
   <https://download.nvidia.com/XFree86/Linux-x86_64/580.105.08/README/gsp.html>
 - NVIDIA 580.173.02 supported-products table:
@@ -459,8 +688,12 @@ POSIX hosts and skipped on Windows.
   <https://github.com/abobasixseven/unlock-cmp-170hx/issues/1>
 - Audited kinako fork referenced by that guide:
   <https://github.com/kinako404/cmpunlocker/tree/6cf67b319f8d14a396f6d905211071ff11076004>
+- Audited 610 module implementation:
+  <https://github.com/amoghmunikote/cmpunlocker/tree/0a5f0624cc6f4cbbf3f2e8d357e891c4a64cc8a2>
 
-The payload frame format and community constants were derived from GPL-2.0 code,
-so this repository is licensed under GPL-2.0-only. See [`LICENSE`](LICENSE) and
+The payload frame format, community constants, and experimental 610 module
+mechanics were derived from GPL-2.0 code, so this repository is licensed under
+GPL-2.0-only. NVIDIA files retain their upstream dual MIT/GPL notices after the
+patch is applied. See [`LICENSE`](LICENSE) and
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). Both notices are included in
 built distributions.

@@ -5,6 +5,8 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+/tmp/
 *.patched.bin
 gsp.*.bin
 sgemm_bench
+other-project/

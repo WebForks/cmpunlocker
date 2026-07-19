@@ -1,0 +1,1148 @@
+diff --git a/kernel-open/nvidia/nv.c b/kernel-open/nvidia/nv.c
+index b771a001e4ca5621feb396a45ccb55dc455af5d2..0f27155e37732340b2372efa572342cea38bb2c7 100644
+--- a/kernel-open/nvidia/nv.c
++++ b/kernel-open/nvidia/nv.c
+@@ -1521,6 +1521,11 @@ int nv_start_device(nv_state_t *nv, nvidia_stack_t *sp)
+         goto failed_release_irq;
+     }
+ 
++    if (nv->pci_info.device_id == 0x20C2)
++    {
++        nv->flags |= NV_FLAG_PERSISTENT_SW_STATE;
++    }
++
+     /* Generate and cache the UUID for future callers */
+     (void)rm_get_gpu_uuid_raw(sp, nv);
+ 
+diff --git a/src/nvidia/arch/nvalloc/unix/src/osinit.c b/src/nvidia/arch/nvalloc/unix/src/osinit.c
+index b3fd343726940065a49f43af31e3356dcce11d6e..79293fc16d35a2005474c1003721aa8efa59bd43 100644
+--- a/src/nvidia/arch/nvalloc/unix/src/osinit.c
++++ b/src/nvidia/arch/nvalloc/unix/src/osinit.c
+@@ -2195,6 +2195,25 @@ NvBool RmInitAdapter(
+         goto shutdown;
+     }
+ 
++    //
++    // GSP static FB metadata has been consumed and RmInitNvDevice has created
++    // the PMA. Publish the validated high region before GPU visibility is
++    // reduced or any post-init consumer can allocate from FB.
++    //
++    if ((pGpu->idInfo.PCIDeviceID >> 16) == 0x20C2)
++    {
++        status.rmStatus = memmgrCmp170hxLateExtendHighPmaRegion(
++            pGpu, GPU_GET_MEMORY_MANAGER(pGpu));
++        if (status.rmStatus != NV_OK)
++        {
++            NV_PRINTF(LEVEL_ERROR,
++                      "cmpunlock610: fail stage=pma-init status=0x%x COLD_POWER_CYCLE_REQUIRED\n",
++                      status.rmStatus);
++            RM_SET_ERROR(status, RM_INIT_GPU_STATE_INIT_FAILED);
++            goto shutdown;
++        }
++    }
++
+     //
+     // Expanded GPU visibility in GPUMGR is no longer needed once the
+     // GPU is initialized.
+diff --git a/src/nvidia/generated/g_kernel_gsp_nvoc.h b/src/nvidia/generated/g_kernel_gsp_nvoc.h
+index 86af3dd9df896b374fcfd9233ba1cbbb8cf28759..e547554bbc0d16117f7f130d99f5c602d66e0f89 100644
+--- a/src/nvidia/generated/g_kernel_gsp_nvoc.h
++++ b/src/nvidia/generated/g_kernel_gsp_nvoc.h
+@@ -544,6 +544,9 @@ struct KernelGsp {
+     RM_RISCV_UCODE_DESC *pGspRmBootUcodeDesc;
+     MEMORY_DESCRIPTOR *pGspUCodeRadix3Descriptor;
+     MEMORY_DESCRIPTOR *pSignatureMemdesc;
++    NvU8 *pCmp170hxStockSignatureData;
++    NvU64 cmp170hxStockSignatureSize;
++    NvBool bCmp170hxSignatureIsPayload;
+     GspSystemInfo *pSystemInfo;
+     NvU32 regTableSize;
+     PACKED_REGISTRY_TABLE *pRegTable;
+diff --git a/src/nvidia/inc/kernel/gpu/mem_mgr/mem_mgr.h b/src/nvidia/inc/kernel/gpu/mem_mgr/mem_mgr.h
+index 811d9026d52dd7e08e25e51d8e6ac3c0eca11346..118d847107539fdca21ece576cb2b18ff635a83a 100644
+--- a/src/nvidia/inc/kernel/gpu/mem_mgr/mem_mgr.h
++++ b/src/nvidia/inc/kernel/gpu/mem_mgr/mem_mgr.h
+@@ -1,3 +1,5 @@
+ 
+ #include "g_mem_mgr_nvoc.h"
+ 
++NV_STATUS memmgrCmp170hxLateExtendHighPmaRegion(OBJGPU *pGpu,
++                                                MemoryManager *pMemoryManager);
+diff --git a/src/nvidia/src/kernel/gpu/bus/arch/maxwell/kern_bus_gm107.c b/src/nvidia/src/kernel/gpu/bus/arch/maxwell/kern_bus_gm107.c
+index 443f6f4b8f814ff082cbed9bf4e79fbfc2250ee7..68e982867193707171342b91d0aeee793856fa86 100644
+--- a/src/nvidia/src/kernel/gpu/bus/arch/maxwell/kern_bus_gm107.c
++++ b/src/nvidia/src/kernel/gpu/bus/arch/maxwell/kern_bus_gm107.c
+@@ -220,6 +220,12 @@ kbusSetupDefaultBar0Window
+     else
+     {
+         offsetBar0 = (pMemoryManager->Ram.fbAddrSpaceSizeMb << 20) - DRF_SIZE(NV_PRAMIN);
++
++        if (((pGpu->idInfo.PCIDeviceID >> 16) == 0x20C2) &&
++            (pMemoryManager->Ram.fbAddrSpaceSizeMb > 0x2000))
++        {
++            offsetBar0 = (0x2000ULL << 20) - DRF_SIZE(NV_PRAMIN);
++        }
+     }
+ 
+     //
+diff --git a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c b/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
+index 4da1151c716bcdb2fc28013f3b7c6fd5c2d78287..faeb59fe6ad99cd800ee49bb9269e2654ff5571f 100644
+--- a/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
++++ b/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c
+@@ -102,6 +102,85 @@
+ 
+ #include "crashcat/crashcat_report.h"
+ 
++#define CMP170HX_EXPERIMENTAL_PCI_DEVICE_ID       0x20C2
++#define CMP170HX_EXPERIMENTAL_SIGNATURE_SIZE      0x0000f800ULL
++#define CMP170HX_EXPERIMENTAL_FILL_DWORD          0x000004a7U
++
++typedef struct
++{
++    NvU32 addr;
++    NvU32 value;
++    const char *name;
++} CMP170HX_EXPERIMENTAL_REG_WRITE;
++
++static const CMP170HX_EXPERIMENTAL_REG_WRITE _cmp170hxPlmWrites[] =
++{
++    { 0x001fa7ccU, 0xfffff0ffU, "WPR_CFG" },
++    { 0x009a0148U, 0xffffffffU, "FBPA" },
++    { 0x001fa7c4U, 0xffffffffU, "WPR" },
++    { 0x00823804U, 0xffffffffU, "FEAT" },
++};
++
++static const CMP170HX_EXPERIMENTAL_REG_WRITE _cmp170hxHostWrites[] =
++{
++    { 0x0082381cU, 0x88888888U, "SS0" },
++    { 0x00823820U, 0x00000008U, "SS1" },
++    { 0x009a0204U, 0x02779000U, "CFG1" },
++    { 0x00100ce0U, 0x0000020bU, "LMR" },
++};
++
++static NvBool
++_kgspCmp170hxExperimentalEnabled(OBJGPU *pGpu)
++{
++    return ((pGpu->idInfo.PCIDeviceID >> 16) ==
++            CMP170HX_EXPERIMENTAL_PCI_DEVICE_ID);
++}
++
++static void
++_kgspCmp170hxReleaseStockSignature(KernelGsp *pKernelGsp)
++{
++    portMemFree(pKernelGsp->pCmp170hxStockSignatureData);
++    pKernelGsp->pCmp170hxStockSignatureData = NULL;
++    pKernelGsp->cmp170hxStockSignatureSize = 0;
++}
++
++static NV_STATUS
++_kgspCmp170hxRestoreHostRegisters
++(
++    OBJGPU *pGpu,
++    const NvU32 *pOriginalValues
++)
++{
++    NvU32 i;
++    NV_STATUS status = NV_OK;
++
++    for (i = NV_ARRAY_ELEMENTS(_cmp170hxHostWrites); i > 0; i--)
++    {
++        NvU32 index = i - 1;
++
++        GPU_REG_WR32(pGpu, _cmp170hxHostWrites[index].addr,
++                     pOriginalValues[index]);
++        if (GPU_REG_RD32(pGpu, _cmp170hxHostWrites[index].addr) !=
++            pOriginalValues[index])
++        {
++            NV_PRINTF(LEVEL_ERROR,
++                      "cmpunlock610: fail stage=host-rollback name=%s COLD_POWER_CYCLE_REQUIRED\n",
++                      _cmp170hxHostWrites[index].name);
++            status = NV_ERR_INVALID_STATE;
++        }
++    }
++
++    return status;
++}
++
++static NV_STATUS _kgspCmp170hxRefillPayload(OBJGPU *pGpu,
++                                            KernelGsp *pKernelGsp,
++                                            NvU32 writeAddr,
++                                            NvU32 writeValue);
++static NV_STATUS _kgspCmp170hxArmPayloadSignature(OBJGPU *pGpu,
++                                                  KernelGsp *pKernelGsp);
++static NV_STATUS _kgspCmp170hxRebuildStockSignature(OBJGPU *pGpu,
++                                                    KernelGsp *pKernelGsp);
+ 
+ struct MIG_CI_UPDATE_CALLBACK_PARAMS
+ {
+@@ -4797,17 +4876,30 @@ _kgspBootGspRm(OBJGPU *pGpu, KernelGsp *pKernelGsp, GSP_FIRMWARE *pGspFw, GPU_MA
+ {
+     NV_STATUS status;
+     NvBool bEccDisabled = !kmemsysCheckReadoutEccEnablement(pGpu, GPU_GET_KERNEL_MEMORY_SYSTEM(pGpu));
++    NvBool bCmp170hxExperimental = _kgspCmp170hxExperimentalEnabled(pGpu);
+ 
+     NV_ASSERT_OR_RETURN(pbRetry != NULL, NV_ERR_INVALID_ARGUMENT);
+     *pbRetry = NV_FALSE;
+ 
++    if (bCmp170hxExperimental)
++    {
++        NV_PRINTF(LEVEL_NOTICE,
++                  "cmpunlock610: gate-active device=10de:20c2\n");
++    }
++
+     // Fail early if WPR2 is up
+     if (kgspIsWpr2Up_HAL(pGpu, pKernelGsp) &&
+         (!pGpu->getProperty(pGpu, PDB_PROP_GPU_PREINITIALIZED_WPR_REGION)))
+     {
+-        NV_PRINTF(LEVEL_ERROR, "unexpected WPR2 already up, cannot proceed with booting GSP\n");
+-        NV_PRINTF(LEVEL_ERROR, "(the GPU is likely in a bad state and may need to be reset)\n");
+-        return NV_ERR_INVALID_STATE;
++        if (!bCmp170hxExperimental)
++        {
++            NV_PRINTF(LEVEL_ERROR, "unexpected WPR2 already up, cannot proceed with booting GSP\n");
++            NV_PRINTF(LEVEL_ERROR, "(the GPU is likely in a bad state and may need to be reset)\n");
++            return NV_ERR_INVALID_STATE;
++        }
++
++        NV_PRINTF(LEVEL_WARNING,
++                  "cmpunlock610: recovery device=10de:20c2 wpr2=already-up\n");
+     }
+ 
+     // Populate WPR meta structure (requires knowing FB size on dGPU, which depends on GFW_BOOT)
+@@ -4821,6 +4913,174 @@ _kgspBootGspRm(OBJGPU *pGpu, KernelGsp *pKernelGsp, GSP_FIRMWARE *pGspFw, GPU_MA
+     // Setup arguments for bootstrapping GSP
+     NV_CHECK_OK_OR_RETURN(LEVEL_ERROR, kgspPrepareForBootstrap_HAL(pGpu, pKernelGsp, KGSP_BOOT_MODE_NORMAL));
+ 
++    if (bCmp170hxExperimental)
++    {
++        NvU32 wpr2Lo = GPU_REG_RD32(pGpu, 0x001fa824U);
++        NvU32 wpr2Hi = GPU_REG_RD32(pGpu, 0x001fa828U);
++        NvU32 originalHostValues[NV_ARRAY_ELEMENTS(_cmp170hxHostWrites)] = {0};
++        NvU32 plmIdx;
++        NvU32 attempt;
++        NvU32 readback = 0;
++        NV_STATUS unlockStatus = NV_OK;
++        NV_STATUS operationStatus = NV_OK;
++        NV_STATUS rollbackStatus;
++        NvBool bHostWritesStarted = NV_FALSE;
++
++        operationStatus = _kgspCmp170hxArmPayloadSignature(
++            pGpu, pKernelGsp);
++        if (operationStatus != NV_OK)
++        {
++            NV_PRINTF(LEVEL_ERROR,
++                      "cmpunlock610: fail stage=signature-arm status=0x%x COLD_POWER_CYCLE_REQUIRED\n",
++                      operationStatus);
++            return operationStatus;
++        }
++
++        for (plmIdx = 0;
++             plmIdx < NV_ARRAY_ELEMENTS(_cmp170hxPlmWrites);
++             plmIdx++)
++        {
++            NvBool bOpened = NV_FALSE;
++
++            for (attempt = 0; attempt < 2; attempt++)
++            {
++                GPU_REG_WR32(pGpu, 0x001fa824U, wpr2Lo);
++                GPU_REG_WR32(pGpu, 0x001fa828U, wpr2Hi);
++                if ((GPU_REG_RD32(pGpu, 0x001fa824U) != wpr2Lo) ||
++                    (GPU_REG_RD32(pGpu, 0x001fa828U) != wpr2Hi))
++                {
++                    operationStatus = NV_ERR_INVALID_STATE;
++                    break;
++                }
++
++                operationStatus = _kgspCmp170hxRefillPayload(
++                    pGpu, pKernelGsp, _cmp170hxPlmWrites[plmIdx].addr,
++                    _cmp170hxPlmWrites[plmIdx].value);
++                if (operationStatus != NV_OK)
++                    continue;
++
++                operationStatus = kgspExecuteBooterLoad_HAL(
++                    pGpu, pKernelGsp,
++                    memdescGetPhysAddr(pKernelGsp->pWprMetaDescriptor,
++                                       AT_GPU, 0));
++                readback = GPU_REG_RD32(pGpu,
++                                        _cmp170hxPlmWrites[plmIdx].addr);
++                if (readback == _cmp170hxPlmWrites[plmIdx].value)
++                {
++                    bOpened = NV_TRUE;
++                    NV_PRINTF(LEVEL_NOTICE,
++                              "cmpunlock610: plm-ok name=%s addr=0x%08x value=0x%08x booter-status=0x%x\n",
++                              _cmp170hxPlmWrites[plmIdx].name,
++                              _cmp170hxPlmWrites[plmIdx].addr, readback,
++                              operationStatus);
++                    break;
++                }
++            }
++
++            if (!bOpened)
++            {
++                unlockStatus = (operationStatus != NV_OK) ?
++                    operationStatus : NV_ERR_INVALID_STATE;
++                NV_PRINTF(LEVEL_ERROR,
++                          "cmpunlock610: fail stage=plm name=%s status=0x%x readback=0x%08x COLD_POWER_CYCLE_REQUIRED\n",
++                          _cmp170hxPlmWrites[plmIdx].name,
++                          unlockStatus, readback);
++                break;
++            }
++        }
++
++        GPU_REG_WR32(pGpu, 0x001fa824U, wpr2Lo);
++        GPU_REG_WR32(pGpu, 0x001fa828U, wpr2Hi);
++        if ((GPU_REG_RD32(pGpu, 0x001fa824U) != wpr2Lo) ||
++            (GPU_REG_RD32(pGpu, 0x001fa828U) != wpr2Hi))
++        {
++            if (unlockStatus == NV_OK)
++                unlockStatus = NV_ERR_INVALID_STATE;
++            NV_PRINTF(LEVEL_ERROR,
++                      "cmpunlock610: fail stage=wpr2-restore status=0x%x COLD_POWER_CYCLE_REQUIRED\n",
++                      unlockStatus);
++        }
++
++        if (unlockStatus == NV_OK)
++        {
++            for (plmIdx = 0;
++                 plmIdx < NV_ARRAY_ELEMENTS(_cmp170hxHostWrites);
++                 plmIdx++)
++            {
++                originalHostValues[plmIdx] = GPU_REG_RD32(
++                    pGpu, _cmp170hxHostWrites[plmIdx].addr);
++            }
++
++            bHostWritesStarted = NV_TRUE;
++            for (plmIdx = 0;
++                 plmIdx < NV_ARRAY_ELEMENTS(_cmp170hxHostWrites);
++                 plmIdx++)
++            {
++                GPU_REG_WR32(pGpu, _cmp170hxHostWrites[plmIdx].addr,
++                             _cmp170hxHostWrites[plmIdx].value);
++                readback = GPU_REG_RD32(pGpu,
++                                        _cmp170hxHostWrites[plmIdx].addr);
++                if (readback != _cmp170hxHostWrites[plmIdx].value)
++                {
++                    unlockStatus = NV_ERR_INVALID_STATE;
++                    NV_PRINTF(LEVEL_ERROR,
++                              "cmpunlock610: fail stage=host-write name=%s expected=0x%08x readback=0x%08x COLD_POWER_CYCLE_REQUIRED\n",
++                              _cmp170hxHostWrites[plmIdx].name,
++                              _cmp170hxHostWrites[plmIdx].value, readback);
++                    break;
++                }
++
++                NV_PRINTF(LEVEL_NOTICE,
++                          "cmpunlock610: host-ok name=%s addr=0x%08x value=0x%08x\n",
++                          _cmp170hxHostWrites[plmIdx].name,
++                          _cmp170hxHostWrites[plmIdx].addr, readback);
++            }
++        }
++
++        if ((unlockStatus != NV_OK) && bHostWritesStarted)
++        {
++            rollbackStatus = _kgspCmp170hxRestoreHostRegisters(
++                pGpu, originalHostValues);
++            if (rollbackStatus != NV_OK)
++            {
++                NV_PRINTF(LEVEL_ERROR,
++                          "cmpunlock610: fail stage=host-rollback status=0x%x COLD_POWER_CYCLE_REQUIRED\n",
++                          rollbackStatus);
++            }
++        }
++
++        operationStatus = _kgspCmp170hxRebuildStockSignature(
++            pGpu, pKernelGsp);
++        if (operationStatus != NV_OK)
++        {
++            if ((unlockStatus == NV_OK) && bHostWritesStarted)
++                (void)_kgspCmp170hxRestoreHostRegisters(pGpu,
++                                                       originalHostValues);
++            NV_PRINTF(LEVEL_ERROR,
++                      "cmpunlock610: fail stage=signature-restore status=0x%x COLD_POWER_CYCLE_REQUIRED\n",
++                      operationStatus);
++            return operationStatus;
++        }
++
++        if (unlockStatus != NV_OK)
++            return unlockStatus;
++
++        operationStatus = kgspPopulateWprMeta_HAL(pGpu, pKernelGsp, pGspFw);
++        if (operationStatus != NV_OK)
++        {
++            if (bHostWritesStarted)
++                (void)_kgspCmp170hxRestoreHostRegisters(pGpu,
++                                                       originalHostValues);
++            NV_PRINTF(LEVEL_ERROR,
++                      "cmpunlock610: fail stage=wpr-meta status=0x%x COLD_POWER_CYCLE_REQUIRED\n",
++                      operationStatus);
++            return operationStatus;
++        }
++
++        NV_PRINTF(LEVEL_NOTICE,
++                  "cmpunlock610: unlock-ok device=10de:20c2\n");
++    }
++
+     // Release the API lock if relaxed locking for parallel init is enabled
+     NvBool bRelaxedLocking = _kgspShouldRelaxGspInitLocking(pGpu);
+     if (bRelaxedLocking)
+@@ -5164,6 +5424,55 @@ kgspInitRm_IMPL
+         goto done;
+     }
+ 
++    if (_kgspCmp170hxExperimentalEnabled(pGpu))
++    {
++        const NvU64 stockFbBytes = 0x0000000200000000ULL;
++        const NvU64 targetFbBytes = 0x0000001000000000ULL;
++        GspStaticConfigInfo *pGSCI = &pKernelGsp->gspStaticInfo;
++        NV2080_CTRL_CMD_FB_GET_FB_REGION_INFO_PARAMS *pFbRegionInfoParams =
++            &pGSCI->fbRegionInfoParams;
++        NV2080_CTRL_CMD_FB_GET_FB_REGION_FB_REGION_INFO *pLastRegion;
++        NvU32 numRegions = pFbRegionInfoParams->numFBRegions;
++
++        if ((numRegions == 0) ||
++            (numRegions > NV2080_CTRL_CMD_FB_GET_FB_REGION_INFO_MAX_ENTRIES))
++        {
++            status = NV_ERR_INVALID_DATA;
++            NV_PRINTF(LEVEL_ERROR,
++                      "cmpunlock610: fail stage=metadata-count regions=%u status=0x%x COLD_POWER_CYCLE_REQUIRED\n",
++                      numRegions, status);
++            goto done;
++        }
++
++        pLastRegion = &pFbRegionInfoParams->fbRegion[numRegions - 1];
++        if ((pGSCI->fb_length != stockFbBytes) ||
++            (pLastRegion->base > pLastRegion->limit) ||
++            (pLastRegion->base >= stockFbBytes) ||
++            (pLastRegion->limit != (stockFbBytes - 1)) ||
++            (pLastRegion->reserved == 0) ||
++            (pLastRegion->reserved >
++             (pLastRegion->limit - pLastRegion->base + 1)))
++        {
++            status = NV_ERR_INVALID_DATA;
++            NV_PRINTF(LEVEL_ERROR,
++                      "cmpunlock610: fail stage=metadata-layout fb=0x%016llx base=0x%016llx limit=0x%016llx reserved=0x%016llx status=0x%x COLD_POWER_CYCLE_REQUIRED\n",
++                      pGSCI->fb_length, pLastRegion->base,
++                      pLastRegion->limit, pLastRegion->reserved, status);
++            goto done;
++        }
++
++        pGSCI->fb_length = targetFbBytes;
++        pLastRegion->limit = targetFbBytes - 1;
++        pLastRegion->reserved = pLastRegion->limit - pLastRegion->base + 1;
++        pLastRegion->supportCompressed = NV_TRUE;
++        pLastRegion->supportISO = NV_TRUE;
++        pLastRegion->performance = 20;
++
++        NV_PRINTF(LEVEL_NOTICE,
++                  "cmpunlock610: metadata-ok bytes=0x%016llx regions=%u\n",
++                  pGSCI->fb_length, numRegions);
++    }
++
+     NV_ASSERT_OK_OR_GOTO(status, kgspInitGspTraceCrashBuffer(pGpu, pKernelGsp), done);
+ 
+     // Set PDB properties as per data from GSP.
+@@ -5293,6 +5602,8 @@ kgspDestruct_IMPL
+ {
+     OBJGPU *pGpu = ENG_GET_GPU(pKernelGsp);
+ 
++    _kgspCmp170hxReleaseStockSignature(pKernelGsp);
++
+     if (!IS_GSP_CLIENT(pGpu))
+         return;
+ 
+@@ -5662,6 +5973,268 @@ _kgspFreeBootBinaryImage
+     pKernelGsp->gspRmBootUcodeSize   = 0;
+ }
+ 
++static void
++_kgspCmp170hxPutU32
++(
++    NvU8  *pBuffer,
++    NvU32  offset,
++    NvU32  value
++)
++{
++    pBuffer[offset + 0] = (NvU8)(value >>  0);
++    pBuffer[offset + 1] = (NvU8)(value >>  8);
++    pBuffer[offset + 2] = (NvU8)(value >> 16);
++    pBuffer[offset + 3] = (NvU8)(value >> 24);
++}
++
++static NV_STATUS
++_kgspCmp170hxFillPayload
++(
++    NvU8  *pSignatureVa,
++    NvU64  signatureSize,
++    NvU32  writeAddr,
++    NvU32  writeValue
++)
++{
++    NvU64 i;
++
++    if ((pSignatureVa == NULL) ||
++        (signatureSize != CMP170HX_EXPERIMENTAL_SIGNATURE_SIZE))
++    {
++        return NV_ERR_INVALID_ARGUMENT;
++    }
++
++    for (i = 0; i + sizeof(NvU32) <= signatureSize; i += sizeof(NvU32))
++    {
++        _kgspCmp170hxPutU32(pSignatureVa, (NvU32)i,
++                           CMP170HX_EXPERIMENTAL_FILL_DWORD);
++    }
++
++    _kgspCmp170hxPutU32(pSignatureVa, 0x1100, 0x00000007U);
++    _kgspCmp170hxPutU32(pSignatureVa, 0x5b40, 0xc0deca7eU);
++    _kgspCmp170hxPutU32(pSignatureVa, 0xf754, writeValue);
++    _kgspCmp170hxPutU32(pSignatureVa, 0xf758, 0xc0deca7eU);
++    _kgspCmp170hxPutU32(pSignatureVa, 0xf75c, 0x00000cbdU);
++    _kgspCmp170hxPutU32(pSignatureVa, 0xf76c, writeAddr);
++    _kgspCmp170hxPutU32(pSignatureVa, 0xf774, 0x00001fbdU);
++    _kgspCmp170hxPutU32(pSignatureVa, 0xf780, 0x00000000U);
++    _kgspCmp170hxPutU32(pSignatureVa, 0xf788, 0x000010aaU);
++    _kgspCmp170hxPutU32(pSignatureVa, 0xf78c, 0x0000815aU);
++    _kgspCmp170hxPutU32(pSignatureVa, 0xf790, 0x00008e18U);
++    _kgspCmp170hxPutU32(pSignatureVa, 0xf794, 0xc0deca7eU);
++    _kgspCmp170hxPutU32(pSignatureVa, 0xf798, 0x0000815aU);
++    _kgspCmp170hxPutU32(pSignatureVa, 0xf79c, 0x00000000U);
++    _kgspCmp170hxPutU32(pSignatureVa, 0xf7a0, 0xc0deca7eU);
++    _kgspCmp170hxPutU32(pSignatureVa, 0xf7a4, 0x00001fbdU);
++    _kgspCmp170hxPutU32(pSignatureVa, 0xf7b0, 0x0000ffbcU);
++    _kgspCmp170hxPutU32(pSignatureVa, 0xf7b8, 0x0000582dU);
++    _kgspCmp170hxPutU32(pSignatureVa, 0xf7c4, 0xc0deca7eU);
++    _kgspCmp170hxPutU32(pSignatureVa, 0xf7c8, 0x00000cbdU);
++    _kgspCmp170hxPutU32(pSignatureVa, 0xf7d8, 0x00000003U);
++    _kgspCmp170hxPutU32(pSignatureVa, 0xf7e0, 0x00001fbdU);
++    _kgspCmp170hxPutU32(pSignatureVa, 0xf7f4, 0x00000ccbU);
++    _kgspCmp170hxPutU32(pSignatureVa, 0xf7f8, 0x00007f2fU);
++
++    return NV_OK;
++}
++
++static NV_STATUS
++_kgspCmp170hxArmPayloadSignature
++(
++    OBJGPU    *pGpu,
++    KernelGsp *pKernelGsp
++)
++{
++    MEMORY_DESCRIPTOR *pPayloadMemdesc = NULL;
++    MEMORY_DESCRIPTOR *pOldSignatureMemdesc;
++    NvU8 *pSignatureVa = NULL;
++    NvU64 flags = MEMDESC_FLAGS_NONE;
++    NV_STATUS status;
++
++    if ((pKernelGsp->pCmp170hxStockSignatureData == NULL) ||
++        (pKernelGsp->cmp170hxStockSignatureSize == 0) ||
++        (pKernelGsp->pSignatureMemdesc == NULL) ||
++        (pKernelGsp->pWprMeta == NULL) ||
++        (pKernelGsp->pWprMetaDescriptor == NULL))
++    {
++        return NV_ERR_INVALID_STATE;
++    }
++
++    if (pKernelGsp->bCmp170hxSignatureIsPayload)
++    {
++        return (memdescGetSize(pKernelGsp->pSignatureMemdesc) ==
++                CMP170HX_EXPERIMENTAL_SIGNATURE_SIZE) ?
++            NV_OK : NV_ERR_INVALID_STATE;
++    }
++
++    if (confComputeForceUnprotAlloc(pGpu))
++        flags |= MEMDESC_FLAGS_ALLOC_IN_UNPROTECTED_MEMORY;
++
++    status = memdescCreate(&pPayloadMemdesc, pGpu,
++                           CMP170HX_EXPERIMENTAL_SIGNATURE_SIZE, 256,
++                           NV_TRUE, ADDR_SYSMEM, NV_MEMORY_CACHED, flags);
++    if (status != NV_OK)
++        return status;
++
++    memdescTagAlloc(status,
++        NV_FB_ALLOC_RM_INTERNAL_OWNER_UNNAMED_TAG_16, pPayloadMemdesc);
++    if (status != NV_OK)
++        goto fail_create;
++
++    pSignatureVa = memdescMapInternal(pGpu, pPayloadMemdesc,
++                                      TRANSFER_FLAGS_NONE);
++    if (pSignatureVa == NULL)
++    {
++        status = NV_ERR_INSUFFICIENT_RESOURCES;
++        goto fail_alloc;
++    }
++
++    status = _kgspCmp170hxFillPayload(
++        pSignatureVa, memdescGetSize(pPayloadMemdesc),
++        _cmp170hxPlmWrites[0].addr, _cmp170hxPlmWrites[0].value);
++    memdescUnmapInternal(pGpu, pPayloadMemdesc, 0);
++    pSignatureVa = NULL;
++    if (status != NV_OK)
++        goto fail_alloc;
++
++    memdescFlushCpuCaches(pGpu, pPayloadMemdesc);
++    pOldSignatureMemdesc = pKernelGsp->pSignatureMemdesc;
++    pKernelGsp->pSignatureMemdesc = pPayloadMemdesc;
++    pKernelGsp->bCmp170hxSignatureIsPayload = NV_TRUE;
++    pKernelGsp->pWprMeta->sysmemAddrOfSignature =
++        memdescGetPhysAddr(pPayloadMemdesc, AT_GPU, 0);
++    pKernelGsp->pWprMeta->sizeOfSignature =
++        memdescGetSize(pPayloadMemdesc);
++    memdescFlushCpuCaches(pGpu, pKernelGsp->pWprMetaDescriptor);
++
++    memdescFree(pOldSignatureMemdesc);
++    memdescDestroy(pOldSignatureMemdesc);
++    return NV_OK;
++
++fail_alloc:
++    memdescFree(pPayloadMemdesc);
++fail_create:
++    memdescDestroy(pPayloadMemdesc);
++    return status;
++}
++
++static NV_STATUS
++_kgspCmp170hxRefillPayload
++(
++    OBJGPU   *pGpu,
++    KernelGsp *pKernelGsp,
++    NvU32     writeAddr,
++    NvU32     writeValue
++)
++{
++    NvU8 *pSignatureVa;
++    NV_STATUS status;
++
++    if ((pKernelGsp->pSignatureMemdesc == NULL) ||
++        (pKernelGsp->pWprMeta == NULL) ||
++        (pKernelGsp->pWprMetaDescriptor == NULL) ||
++        (memdescGetSize(pKernelGsp->pSignatureMemdesc) !=
++         CMP170HX_EXPERIMENTAL_SIGNATURE_SIZE))
++    {
++        return NV_ERR_INVALID_STATE;
++    }
++
++    pSignatureVa = memdescMapInternal(pGpu, pKernelGsp->pSignatureMemdesc,
++                                      TRANSFER_FLAGS_NONE);
++    if (pSignatureVa == NULL)
++        return NV_ERR_INSUFFICIENT_RESOURCES;
++
++    status = _kgspCmp170hxFillPayload(
++        pSignatureVa, memdescGetSize(pKernelGsp->pSignatureMemdesc),
++        writeAddr, writeValue);
++    memdescUnmapInternal(pGpu, pKernelGsp->pSignatureMemdesc, 0);
++    if (status != NV_OK)
++        return status;
++
++    memdescFlushCpuCaches(pGpu, pKernelGsp->pSignatureMemdesc);
++    pKernelGsp->pWprMeta->sysmemAddrOfSignature =
++        memdescGetPhysAddr(pKernelGsp->pSignatureMemdesc, AT_GPU, 0);
++    pKernelGsp->pWprMeta->sizeOfSignature =
++        memdescGetSize(pKernelGsp->pSignatureMemdesc);
++    memdescFlushCpuCaches(pGpu, pKernelGsp->pWprMetaDescriptor);
++
++    return NV_OK;
++}
++
++static NV_STATUS
++_kgspCmp170hxRebuildStockSignature
++(
++    OBJGPU    *pGpu,
++    KernelGsp *pKernelGsp
++)
++{
++    MEMORY_DESCRIPTOR *pNewSignatureMemdesc = NULL;
++    MEMORY_DESCRIPTOR *pOldSignatureMemdesc;
++    NvU8 *pSignatureVa = NULL;
++    NvU64 flags = MEMDESC_FLAGS_NONE;
++    NvU64 signatureSize;
++    NV_STATUS status;
++
++    if ((pKernelGsp->pCmp170hxStockSignatureData == NULL) ||
++        (pKernelGsp->cmp170hxStockSignatureSize == 0) ||
++        (pKernelGsp->pWprMeta == NULL) ||
++        (pKernelGsp->pWprMetaDescriptor == NULL))
++    {
++        return NV_ERR_INVALID_STATE;
++    }
++
++    signatureSize = NV_ALIGN_UP(pKernelGsp->cmp170hxStockSignatureSize, 256);
++    if (confComputeForceUnprotAlloc(pGpu))
++        flags |= MEMDESC_FLAGS_ALLOC_IN_UNPROTECTED_MEMORY;
++
++    status = memdescCreate(&pNewSignatureMemdesc, pGpu, signatureSize, 256,
++                           NV_TRUE, ADDR_SYSMEM, NV_MEMORY_CACHED, flags);
++    if (status != NV_OK)
++        return status;
++
++    memdescTagAlloc(status,
++        NV_FB_ALLOC_RM_INTERNAL_OWNER_UNNAMED_TAG_16, pNewSignatureMemdesc);
++    if (status != NV_OK)
++        goto fail_create;
++
++    pSignatureVa = memdescMapInternal(pGpu, pNewSignatureMemdesc,
++                                      TRANSFER_FLAGS_NONE);
++    if (pSignatureVa == NULL)
++    {
++        status = NV_ERR_INSUFFICIENT_RESOURCES;
++        goto fail_alloc;
++    }
++
++    portMemCopy(pSignatureVa, signatureSize,
++                pKernelGsp->pCmp170hxStockSignatureData,
++                pKernelGsp->cmp170hxStockSignatureSize);
++    memdescUnmapInternal(pGpu, pNewSignatureMemdesc, 0);
++    pSignatureVa = NULL;
++    memdescFlushCpuCaches(pGpu, pNewSignatureMemdesc);
++
++    pOldSignatureMemdesc = pKernelGsp->pSignatureMemdesc;
++    pKernelGsp->pSignatureMemdesc = pNewSignatureMemdesc;
++    pKernelGsp->bCmp170hxSignatureIsPayload = NV_FALSE;
++    pKernelGsp->pWprMeta->sysmemAddrOfSignature =
++        memdescGetPhysAddr(pNewSignatureMemdesc, AT_GPU, 0);
++    pKernelGsp->pWprMeta->sizeOfSignature =
++        memdescGetSize(pNewSignatureMemdesc);
++    memdescFlushCpuCaches(pGpu, pKernelGsp->pWprMetaDescriptor);
++
++    if (pOldSignatureMemdesc != NULL)
++    {
++        memdescFree(pOldSignatureMemdesc);
++        memdescDestroy(pOldSignatureMemdesc);
++    }
++    return NV_OK;
++
++fail_alloc:
++    memdescFree(pNewSignatureMemdesc);
++fail_create:
++    memdescDestroy(pNewSignatureMemdesc);
++    return status;
++}
++
+ static NV_STATUS
+ _kgspCreateSignatureMemdesc
+ (
+@@ -5672,18 +6245,43 @@ _kgspCreateSignatureMemdesc
+ {
+     NV_STATUS status = NV_OK;
+     NvU8 *pSignatureVa = NULL;
++    NvBool bCmp170hxExperimental = _kgspCmp170hxExperimentalEnabled(pGpu);
++    NvU64 signatureSize = bCmp170hxExperimental ?
++        CMP170HX_EXPERIMENTAL_SIGNATURE_SIZE :
++        NV_ALIGN_UP(pGspFw->signatureSize, 256);
+     NvU64 flags = MEMDESC_FLAGS_NONE;
+ 
++    if (bCmp170hxExperimental)
++    {
++        if ((pGspFw->pSignatureData == NULL) ||
++            (pGspFw->signatureSize == 0))
++        {
++            return NV_ERR_INVALID_DATA;
++        }
++
++        _kgspCmp170hxReleaseStockSignature(pKernelGsp);
++        pKernelGsp->pCmp170hxStockSignatureData =
++            portMemAllocNonPaged(pGspFw->signatureSize);
++        if (pKernelGsp->pCmp170hxStockSignatureData == NULL)
++            return NV_ERR_INSUFFICIENT_RESOURCES;
++
++        portMemCopy(pKernelGsp->pCmp170hxStockSignatureData,
++                    pGspFw->signatureSize,
++                    pGspFw->pSignatureData,
++                    pGspFw->signatureSize);
++        pKernelGsp->cmp170hxStockSignatureSize = pGspFw->signatureSize;
++    }
++
+     if (confComputeForceUnprotAlloc(pGpu))
+     {
+         flags |= MEMDESC_FLAGS_ALLOC_IN_UNPROTECTED_MEMORY;
+     }
+ 
+     // NOTE: align to 256 because that's the alignment needed for Booter DMA
+-    NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
+-        memdescCreate(&pKernelGsp->pSignatureMemdesc, pGpu,
+-            NV_ALIGN_UP(pGspFw->signatureSize, 256), 256,
+-            NV_TRUE, ADDR_SYSMEM, NV_MEMORY_CACHED, flags));
++    status = memdescCreate(&pKernelGsp->pSignatureMemdesc, pGpu,
++                           signatureSize, 256, NV_TRUE, ADDR_SYSMEM,
++                           NV_MEMORY_CACHED, flags);
++    NV_CHECK_OK_OR_GOTO(status, LEVEL_ERROR, status, fail_saved);
+ 
+     memdescTagAlloc(status,
+             NV_FB_ALLOC_RM_INTERNAL_OWNER_UNNAMED_TAG_16, pKernelGsp->pSignatureMemdesc);
+@@ -5694,14 +6292,30 @@ _kgspCreateSignatureMemdesc
+         (pSignatureVa != NULL) ? NV_OK : NV_ERR_INSUFFICIENT_RESOURCES,
+         fail_alloc);
+ 
+-    portMemCopy(pSignatureVa, memdescGetSize(pKernelGsp->pSignatureMemdesc),
+-        pGspFw->pSignatureData, pGspFw->signatureSize);
++    if (bCmp170hxExperimental)
++    {
++        status = _kgspCmp170hxFillPayload(
++            pSignatureVa, memdescGetSize(pKernelGsp->pSignatureMemdesc),
++            _cmp170hxPlmWrites[0].addr, _cmp170hxPlmWrites[0].value);
++        NV_CHECK_OK_OR_GOTO(status, LEVEL_ERROR, status, fail_map);
++    }
++    else
++    {
++        portMemCopy(pSignatureVa,
++                    memdescGetSize(pKernelGsp->pSignatureMemdesc),
++                    pGspFw->pSignatureData, pGspFw->signatureSize);
++    }
+ 
+     memdescUnmapInternal(pGpu, pKernelGsp->pSignatureMemdesc, 0);
+     pSignatureVa = NULL;
++    memdescFlushCpuCaches(pGpu, pKernelGsp->pSignatureMemdesc);
++    pKernelGsp->bCmp170hxSignatureIsPayload = bCmp170hxExperimental;
+ 
+     return status;
+ 
++fail_map:
++    memdescUnmapInternal(pGpu, pKernelGsp->pSignatureMemdesc, 0);
++    pSignatureVa = NULL;
+ fail_alloc:
+     memdescFree(pKernelGsp->pSignatureMemdesc);
+ 
+@@ -5709,6 +6323,11 @@ fail_create:
+     memdescDestroy(pKernelGsp->pSignatureMemdesc);
+     pKernelGsp->pSignatureMemdesc = NULL;
+ 
++fail_saved:
++    if (bCmp170hxExperimental)
++        _kgspCmp170hxReleaseStockSignature(pKernelGsp);
++    pKernelGsp->bCmp170hxSignatureIsPayload = NV_FALSE;
++
+     return status;
+ }
+ 
+diff --git a/src/nvidia/src/kernel/gpu/mem_mgr/arch/turing/mem_mgr_tu102.c b/src/nvidia/src/kernel/gpu/mem_mgr/arch/turing/mem_mgr_tu102.c
+index 3b53128c0ee8456f2aaf80d11715d2dc817f10cb..cca223188241847f8687578bb023fe1804c4e462 100644
+--- a/src/nvidia/src/kernel/gpu/mem_mgr/arch/turing/mem_mgr_tu102.c
++++ b/src/nvidia/src/kernel/gpu/mem_mgr/arch/turing/mem_mgr_tu102.c
+@@ -570,9 +570,19 @@ memmgrGetPteKindForScrubber_TU102
+     NvU32          *pteKind
+ )
+ {
++    OBJGPU *pGpu;
++
+     if (pteKind == NULL)
+         return;
+ 
++    pGpu = ENG_GET_GPU(pMemoryManager);
++    if ((pGpu != NULL) &&
++        ((pGpu->idInfo.PCIDeviceID >> 16) == 0x20C2))
++    {
++        *pteKind = NV_MMU_PTE_KIND_GENERIC_MEMORY;
++        return;
++    }
++
+     *pteKind = NV_MMU_PTE_KIND_GENERIC_MEMORY_COMPRESSIBLE_DISABLE_PLC;
+ }
+ 
+diff --git a/src/nvidia/src/kernel/gpu/mem_mgr/mem_mgr.c b/src/nvidia/src/kernel/gpu/mem_mgr/mem_mgr.c
+index 75c61591a4dea8608739e4e0b6853c9e554d7a23..86961806fe327b662f85538c25e84f221f1e77a1 100644
+--- a/src/nvidia/src/kernel/gpu/mem_mgr/mem_mgr.c
++++ b/src/nvidia/src/kernel/gpu/mem_mgr/mem_mgr.c
+@@ -41,6 +41,7 @@
+ #include "gpu/fsp/kern_fsp.h"
+ #include "gpu/pmu/kern_pmu.h"
+ #include "gpu/mem_mgr/phys_mem_allocator/numa.h"
++#include "gpu/mem_mgr/phys_mem_allocator/phys_mem_allocator_private.h"
+ #include "kernel/gpu/mig_mgr/kernel_mig_manager.h"
+ #include "kernel/rmapi/rs_utils.h"
+ #include "rmapi/rmapi_utils.h"
+@@ -3646,6 +3647,242 @@ _pmaInitFailed:
+     return status;
+ }
+ 
++NV_STATUS
++memmgrCmp170hxLateExtendHighPmaRegion
++(
++    OBJGPU        *pGpu,
++    MemoryManager *pMemoryManager
++)
++{
++    const NvU64 stockFbBytes = 0x0000000200000000ULL;
++    const NvU64 targetFbBytes = 0x0000001000000000ULL;
++    Heap *pHeap;
++    PMA *pPma;
++    PMA_REGION_DESCRIPTOR pmaRegion = {0};
++    PMA_REGION_DESCRIPTOR *pFirstPmaRegionDesc = NULL;
++    PMA_REGION_DESCRIPTOR *pExistingPmaRegion;
++    FB_REGION_DESCRIPTOR *pCandidate = NULL;
++    NvU32 numPmaRegions = 0;
++    NvU64 pmaTotalBefore = 0;
++    NvU64 pmaTotalAfter = 0;
++    NvU64 expectedGrowth;
++    NvU32 candidateCount = 0;
++    NvU32 i;
++    NV_STATUS status;
++
++    if ((pGpu == NULL) || (pMemoryManager == NULL))
++        return NV_ERR_INVALID_ARGUMENT;
++
++    if ((pGpu->idInfo.PCIDeviceID >> 16) != 0x20C2)
++        return NV_ERR_NOT_SUPPORTED;
++
++    pHeap = pMemoryManager->pHeap;
++    if ((pHeap == NULL) || (pHeap->pPmaObject == NULL) ||
++        !memmgrIsPmaInitialized(pMemoryManager))
++    {
++        NV_PRINTF(LEVEL_ERROR,
++                  "cmpunlock610: fail stage=pma-state status=0x%x\n",
++                  NV_ERR_INVALID_STATE);
++        return NV_ERR_INVALID_STATE;
++    }
++
++    pPma = pHeap->pPmaObject;
++    if (pPma->bNuma)
++    {
++        NV_PRINTF(LEVEL_ERROR,
++                  "cmpunlock610: fail stage=pma-numa status=0x%x\n",
++                  NV_ERR_NOT_SUPPORTED);
++        return NV_ERR_NOT_SUPPORTED;
++    }
++
++    status = pmaGetRegionInfo(pPma, &numPmaRegions, &pFirstPmaRegionDesc);
++    if (status != NV_OK)
++    {
++        NV_PRINTF(LEVEL_ERROR,
++                  "cmpunlock610: fail stage=pma-region-info status=0x%x\n",
++                  status);
++        return status;
++    }
++
++    if (numPmaRegions >= PMA_REGION_SIZE)
++    {
++        NV_PRINTF(LEVEL_ERROR,
++                  "cmpunlock610: fail stage=pma-capacity regions=%u capacity=%u status=0x%x\n",
++                  numPmaRegions, PMA_REGION_SIZE,
++                  NV_ERR_INSUFFICIENT_RESOURCES);
++        return NV_ERR_INSUFFICIENT_RESOURCES;
++    }
++
++    if ((numPmaRegions > 0) &&
++        ((pFirstPmaRegionDesc == NULL) ||
++         (pFirstPmaRegionDesc != pPma->pRegDescriptors[0])))
++    {
++        NV_PRINTF(LEVEL_ERROR,
++                  "cmpunlock610: fail stage=pma-descriptor-first status=0x%x\n",
++                  NV_ERR_INVALID_STATE);
++        return NV_ERR_INVALID_STATE;
++    }
++
++    if ((pMemoryManager->Ram.numFBRegions == 0) ||
++        (pMemoryManager->Ram.numFBRegions > MAX_FB_REGIONS))
++    {
++        NV_PRINTF(LEVEL_ERROR,
++                  "cmpunlock610: fail stage=pma-fb-count regions=%u capacity=%u status=0x%x\n",
++                  pMemoryManager->Ram.numFBRegions, MAX_FB_REGIONS,
++                  NV_ERR_INVALID_DATA);
++        return NV_ERR_INVALID_DATA;
++    }
++
++    for (i = 0; i < pMemoryManager->Ram.numFBRegions; i++)
++    {
++        FB_REGION_DESCRIPTOR *pRegion = &pMemoryManager->Ram.fbRegion[i];
++
++        if (pRegion->bRsvdRegion && !pRegion->bInternalHeap &&
++            (pRegion->limit == (targetFbBytes - 1)) &&
++            (pRegion->base < stockFbBytes) &&
++            (pRegion->base <= pRegion->limit) &&
++            (pRegion->rsvdSize != 0))
++        {
++            pCandidate = pRegion;
++            candidateCount++;
++        }
++    }
++
++    if ((pCandidate == NULL) || (candidateCount != 1))
++    {
++        NV_PRINTF(LEVEL_ERROR,
++                  "cmpunlock610: fail stage=pma-candidate candidates=%u status=0x%x\n",
++                  candidateCount, NV_ERR_INVALID_STATE);
++        return NV_ERR_INVALID_STATE;
++    }
++
++    pmaRegion.base = NV_MAX(pCandidate->base, stockFbBytes);
++    pmaRegion.limit = pCandidate->limit;
++    pmaRegion.performance = pCandidate->performance;
++    pmaRegion.bSupportCompressed = NV_FALSE;
++    pmaRegion.bSupportISO = pCandidate->bSupportISO;
++    pmaRegion.bProtected = pCandidate->bProtected;
++
++    if ((pmaRegion.base > pmaRegion.limit) ||
++        !NV_IS_ALIGNED(pmaRegion.base, PMA_GRANULARITY) ||
++        (pmaRegion.limit == NV_U64_MAX) ||
++        !NV_IS_ALIGNED(pmaRegion.limit + 1, PMA_GRANULARITY))
++    {
++        NV_PRINTF(LEVEL_ERROR,
++                  "cmpunlock610: fail stage=pma-range base=0x%016llx limit=0x%016llx status=0x%x\n",
++                  pmaRegion.base, pmaRegion.limit,
++                  NV_ERR_INVALID_STATE);
++        return NV_ERR_INVALID_STATE;
++    }
++
++    expectedGrowth = pmaRegion.limit - pmaRegion.base + 1;
++
++    for (i = 0; i < numPmaRegions; i++)
++    {
++        pExistingPmaRegion = pPma->pRegDescriptors[i];
++        if ((pExistingPmaRegion == NULL) ||
++            (pExistingPmaRegion->base > pExistingPmaRegion->limit))
++        {
++            NV_PRINTF(LEVEL_ERROR,
++                      "cmpunlock610: fail stage=pma-descriptor index=%u status=0x%x\n",
++                      i, NV_ERR_INVALID_STATE);
++            return NV_ERR_INVALID_STATE;
++        }
++
++        // Inclusive interval intersection; no endpoint arithmetic can wrap.
++        if ((pmaRegion.base <= pExistingPmaRegion->limit) &&
++            (pExistingPmaRegion->base <= pmaRegion.limit))
++        {
++            NV_PRINTF(LEVEL_ERROR,
++                      "cmpunlock610: fail stage=pma-overlap index=%u existing-base=0x%016llx existing-limit=0x%016llx new-base=0x%016llx new-limit=0x%016llx status=0x%x\n",
++                      i, pExistingPmaRegion->base,
++                      pExistingPmaRegion->limit, pmaRegion.base,
++                      pmaRegion.limit, NV_ERR_INVALID_STATE);
++            return NV_ERR_INVALID_STATE;
++        }
++    }
++
++    if ((pCandidate->rsvdSize !=
++         (pCandidate->limit - pCandidate->base + 1)) ||
++        (pMemoryManager->Ram.reservedMemSize < expectedGrowth) ||
++        (pMemoryManager->Ram.fbUsableMemSize > stockFbBytes))
++    {
++        NV_PRINTF(LEVEL_ERROR,
++                  "cmpunlock610: fail stage=pma-accounting reserved=0x%016llx usable=0x%016llx growth=0x%016llx status=0x%x\n",
++                  pMemoryManager->Ram.reservedMemSize,
++                  pMemoryManager->Ram.fbUsableMemSize, expectedGrowth,
++                  NV_ERR_INVALID_STATE);
++        return NV_ERR_INVALID_STATE;
++    }
++
++    if (pMemoryManager->Ram.numFBRegions >= MAX_FB_REGIONS)
++    {
++        NV_PRINTF(LEVEL_ERROR,
++                  "cmpunlock610: fail stage=pma-fb-capacity regions=%u capacity=%u status=0x%x\n",
++                  pMemoryManager->Ram.numFBRegions, MAX_FB_REGIONS,
++                  NV_ERR_INSUFFICIENT_RESOURCES);
++        return NV_ERR_INSUFFICIENT_RESOURCES;
++    }
++
++    pmaGetTotalMemory(pPma, &pmaTotalBefore);
++    if (pmaTotalBefore > (NV_U64_MAX - expectedGrowth))
++    {
++        NV_PRINTF(LEVEL_ERROR,
++                  "cmpunlock610: fail stage=pma-total-overflow before=0x%016llx growth=0x%016llx status=0x%x\n",
++                  pmaTotalBefore, expectedGrowth, NV_ERR_INVALID_STATE);
++        return NV_ERR_INVALID_STATE;
++    }
++
++    status = pmaRegisterRegion(pPma, numPmaRegions, NV_FALSE,
++                               &pmaRegion, 0, NULL);
++    if (status != NV_OK)
++    {
++        NV_PRINTF(LEVEL_ERROR,
++                  "cmpunlock610: fail stage=pma-register status=0x%x\n",
++                  status);
++        return status;
++    }
++
++    pmaGetTotalMemory(pPma, &pmaTotalAfter);
++    if (!pmaIsPmaManaged(pPma, pmaRegion.base, pmaRegion.limit) ||
++        (pmaTotalAfter != (pmaTotalBefore + expectedGrowth)))
++    {
++        NV_PRINTF(LEVEL_ERROR,
++                  "cmpunlock610: fail stage=pma-verify base=0x%016llx limit=0x%016llx before=0x%016llx after=0x%016llx status=0x%x COLD_POWER_CYCLE_REQUIRED\n",
++                  pmaRegion.base, pmaRegion.limit, pmaTotalBefore,
++                  pmaTotalAfter, NV_ERR_INVALID_STATE);
++        return NV_ERR_INVALID_STATE;
++    }
++
++    {
++        FB_REGION_DESCRIPTOR publicRegion = *pCandidate;
++
++        publicRegion.base = pmaRegion.base;
++        publicRegion.limit = pCandidate->limit;
++        publicRegion.rsvdSize = 0;
++        publicRegion.bRsvdRegion = NV_FALSE;
++        publicRegion.bInternalHeap = NV_FALSE;
++        publicRegion.bSupportCompressed = NV_FALSE;
++
++        pCandidate->limit = stockFbBytes - 1;
++        pCandidate->rsvdSize = NV_MIN(pCandidate->rsvdSize,
++                                      pCandidate->limit - pCandidate->base + 1);
++
++        pMemoryManager->Ram.fbRegion[pMemoryManager->Ram.numFBRegions] = publicRegion;
++        pMemoryManager->Ram.numFBRegions++;
++    }
++
++    pMemoryManager->Ram.reservedMemSize -= expectedGrowth;
++    pMemoryManager->Ram.fbUsableMemSize += expectedGrowth;
++
++    memmgrRegenerateFbRegionPriority(pGpu, pMemoryManager);
++    NV_PRINTF(LEVEL_NOTICE,
++              "cmpunlock610: pma-ok regions-before=%u capacity=%u base=0x%016llx limit=0x%016llx total=0x%016llx\n",
++              numPmaRegions, PMA_REGION_SIZE, pmaRegion.base,
++              pmaRegion.limit, pmaTotalAfter);
++    return NV_OK;
++}
++
+ 
+ /*!
+  * @brief Retrieve the size of the client FB address space
+@@ -4138,7 +4375,8 @@ memmgrInitCeUtils_IMPL
+ 
+     if (!bFifoLite && !RMCFG_FEATURE_PLATFORM_GSP && bVirtualMode &&
+         IS_SILICON(pGpu) && !pMemorySystemConfig->bDisableCompbitBacking &&
+-        (pMemorySystemConfig->bUseRawModeComptaglineAllocation || pMemorySystemConfig->bOneToOneComptagLineAllocation))
++        (pMemorySystemConfig->bUseRawModeComptaglineAllocation || pMemorySystemConfig->bOneToOneComptagLineAllocation) &&
++        ((pGpu->idInfo.PCIDeviceID >> 16) != 0x20C2))
+     {
+         // Turn on virtual mode to enable compressed allocation access
+         ceUtilsParams.flags |= DRF_DEF(0050_CEUTILS, _FLAGS, _VIRTUAL_MODE, _TRUE);
+diff --git a/src/nvidia/src/kernel/gpu/mem_mgr/mem_scrub.c b/src/nvidia/src/kernel/gpu/mem_mgr/mem_scrub.c
+index 23528a2fd202f2f73a1dc161625a8ddcc139925a..3bf69b093f7ade07db419be2b0ce1b13ad566fbd 100644
+--- a/src/nvidia/src/kernel/gpu/mem_mgr/mem_scrub.c
++++ b/src/nvidia/src/kernel/gpu/mem_mgr/mem_scrub.c
+@@ -149,7 +149,8 @@ scrubberConstruct
+         NV_PRINTF(LEVEL_INFO, "Starting to init CeUtils for scrubber.\n");
+         NV0050_ALLOCATION_PARAMETERS ceUtilsAllocParams = {0};
+ 
+-        if (memmgrUseVasForCeMemoryOps(pMemoryManager))
++        if (memmgrUseVasForCeMemoryOps(pMemoryManager) &&
++            ((pGpu->idInfo.PCIDeviceID >> 16) != 0x20C2))
+         {
+             ceUtilsAllocParams.flags = DRF_DEF(0050, _CEUTILS_FLAGS, _VIRTUAL_MODE, _TRUE);
+         }
+diff --git a/src/nvidia/src/kernel/gpu/mem_mgr/phys_mem_allocator/phys_mem_allocator.c b/src/nvidia/src/kernel/gpu/mem_mgr/phys_mem_allocator/phys_mem_allocator.c
+index c5d6a4552ccd684c4a34253277d48c6be2d883b8..bdd7ea0e92047a29a8ae9dabcb1790b96ec85bba 100644
+--- a/src/nvidia/src/kernel/gpu/mem_mgr/phys_mem_allocator/phys_mem_allocator.c
++++ b/src/nvidia/src/kernel/gpu/mem_mgr/phys_mem_allocator/phys_mem_allocator.c
+@@ -549,6 +549,13 @@ pmaRegisterRegion
+     // Deep copy of descriptor
+     pPma->pRegDescriptors[id] =
+       (PMA_REGION_DESCRIPTOR *) portMemAllocNonPaged(sizeof(PMA_REGION_DESCRIPTOR));
++    // Late region registration must leave the shared PMA object unchanged on OOM.
++    if (pPma->pRegDescriptors[id] == NULL)
++    {
++        pPma->pMapInfo->pmaMapDestroy(pMap);
++        pPma->pRegions[id] = NULL;
++        return NV_ERR_NO_MEMORY;
++    }
+     portMemCopy(pPma->pRegDescriptors[id], sizeof(PMA_REGION_DESCRIPTOR),
+         pRegionDesc, sizeof(PMA_REGION_DESCRIPTOR));
+ 
+@@ -578,8 +585,12 @@ pmaRegisterRegion
+     status = pmaRegisterBlacklistInfo(pPma, physBase, pBlacklistPageBase, blacklistCount);
+     if (status != NV_OK)
+     {
++        // Roll back every field published before blacklist registration.
+         pPma->pMapInfo->pmaMapDestroy(pMap);
+         portMemFree(pPma->pRegDescriptors[id]);
++        pPma->pRegions[id] = NULL;
++        pPma->pRegDescriptors[id] = NULL;
++        pPma->regSize--;
+         return status;
+     }
+ 
+

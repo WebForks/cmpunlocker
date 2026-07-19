@@ -1,1 +1,6 @@
 *.sh text eol=lf
+experimental/610-memory/tools/*.cu text eol=lf
+experimental/610-memory/patches/*.patch text eol=lf
+experimental/610-memory/patches/*.patch whitespace=-blank-at-eol,-blank-at-eof
+experimental/610-memory/manifest.env text eol=lf
+tests/test_610_memory_tools.py text eol=lf

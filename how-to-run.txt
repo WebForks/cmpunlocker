@@ -17,5 +17,8 @@ duplicate the hazardous command sequence so the two guides cannot diverge.
 
 Status: the paper proof bytes are reproduced offline. One external 580.173.02/20c2
 run reports a compute result, but this project has not independently reproduced it
-and the same report says memory remained at 8 GiB. See README.md for the exact
-evidence boundary and the separately pinned reported strategy.
+and the same report says memory remained at 8 GiB. A separate quarantined
+`experimental/610-memory` path now reconstructs a community 8-to-64-GiB module
+experiment, but it is not run by this setup script and has not been hardware-
+validated by this project. See README.md for its exact prerequisites, staged
+test through a 60-GiB allocation, rollback procedure, and evidence boundary.
